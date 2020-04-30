@@ -2,7 +2,7 @@
 """
 Created on Tue Jan  8 13:52:23 2019
 
-@author: nicholas-martino
+@author: nicholas-martino (C) MIT License
 
 """
 
@@ -326,12 +326,9 @@ class GeoScraper:
         search_results = parser.xpath("//div[@id='search-results']//article")
         print(search_results)
 
-
         z = Zillow(name=self.municipality, base_url=base_url)
         data = z.run()
 
-
-        zillow_id = 'X1-ZWz1hjj0anelu3_211k7'
         zillow_data = ZillowWrapper(zillow_id)
         updated_property_details_response = zillow_data.get_updated_property_details(zillow_id)
         result = GetUpdatedPropertyDetails(updated_property_details_response)
@@ -346,7 +343,7 @@ class GeoScraper:
         return None
 
     # Scrape health and safety indicators
-    def air_quality(self, token='306407099d8a8d50a5254d4d0109975aeaf52447'):
+    def air_quality(self):
         """
         A Python wrapper for AQICN API.
         The library can be used to search and retrieve Air Quality Index data.
@@ -525,7 +522,7 @@ class GeoScraper:
                         f.close()
                         time.sleep(1)
                         if file_name not in gdf['file'].unique():
-                            gdf1 = gdf.read_file(f"{directory}/{file_name}", layer='track_points')
+                            gdf1 = gpd.read_file(f"{directory}/{file_name}", layer='track_points')
                             gdf1['file'] = file_name
                             gdf1.crs = 4326
                             gdf1.to_crs(epsg=self.city.crs, inplace=True)
@@ -910,57 +907,3 @@ class Vancouver:
                 print(f"{filename} saved")
         print(str(len(pdfs)) + ' permit documents downloaded at ' + str(datetime.datetime.now()))
         return
-
-
-if __name__ == '__main__':
-    print(f"Start @ {datetime.datetime.now()}")
-    for i in range(100000):
-
-        regions = {
-            'Canada':
-                {
-                    'British Columbia': ['Metro Vancouver']
-                }
-        }
-
-        for key, value in regions.items():
-
-            # Get data
-            bc = BritishColumbia(cities=value['British Columbia'])
-            country = Canada(provinces=[bc])
-            for city in bc.cities:
-                scraper = GeoScraper(city=city)
-                scraper.city.update_databases(bound=True, net=True)
-                mov = scraper.movement_osm_gps()  # OpenStreetMaps
-                emp = scraper.employment_indeed()  # Indeed
-                clh = scraper.housing_craigslist('vancouver', 900)  # Craigslist
-                aqi = scraper.air_quality()  # Air Quality Index
-                print('###')
-            bc.update_databases(icbc=True)  # ICBC
-            bca_dir = '/Volumes/ELabs/50_projects/16_PICS/07_BCA data/'
-            bc.aggregate_bca_from_field(
-                inventory_dir=f'{bca_dir}170811_BCA_Provincial_Data/Inventory Information - RY 2017 - Greater Vancouver.csv',
-                geodatabase_dir=f'{bca_dir}Juchan_backup/BCA_2017_roll_number_method/BCA_2017_roll_number_method.gdb')
-            country.update_databases(census=True)  # StatsCan
-
-            # Analyze data
-            for city in bc.cities:
-                city.network_analysis(
-                    service_areas=[400, 800, 1600],
-                    sample_gdf=gpd.read_file(city.gpkg, layer='land_dissemination_area'),
-                    aggregated_layers={
-                        'network_links': ["network_links_ct"],
-                        'network_nodes': ["network_nodes_ct"],
-                        'land_assessment_fabric': [
-                            "land_assessment_fabric_ct", "NUMBER_OF_BEDROOMS", "NUMBER_OF_BATHROOMS", "elab_use"],
-                        'air_quality': ["aqi"],
-                        'craigslist_housing': ["craigslist_housing_ct", "price_sqft"],
-                        'icbc_accidents': ["icbc_accidents_ct", "Crash Count"]
-                    })
-
-        # Scrape development permits at the City of Vancouver webpage
-        van = Vancouver('/Users/nicholasmartino/GoogleDrive/Geospatial/Databases/Permits/')
-        van.get_permits()
-
-        print(f"Finished @ {datetime.datetime.now()}")
-        time.sleep(14400)
