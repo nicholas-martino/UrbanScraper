@@ -622,8 +622,7 @@ class GeoScraper:
             }
 
             OUTFILE = f"{self.city.directory}Databases/TransitLand/{self.city.municipality}.geojson"
-            if os.path.exists(OUTFILE):
-                raise Exception("File exists: %s" % OUTFILE)
+            if os.path.exists(OUTFILE): os.remove(OUTFILE)
 
             # Group SSPs by (origin, destination) and count
             edges = {}
@@ -699,6 +698,12 @@ class GeoScraper:
 
             gdf = gpd.read_file(OUTFILE)
 
+            try:
+                gdf0 = gpd.read_file(self.city.gpkg, layer='public_transit')
+                gdf = pd.concat([gdf0, gdf])
+            except: pass
+
+            gdf.to_file(self.city.gpkg, layer='public_transit')
             return print('> Public transit frequency downloaded and stored')
 
     def social_twitter(self):
