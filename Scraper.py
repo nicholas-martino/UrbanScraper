@@ -9,15 +9,13 @@ Created on Tue Jan  8 13:52:23 2019
 import datetime
 import glob
 import io
+import json
 import logging
 import os
 import time
 from io import StringIO
-from random import randint, seed
-from urllib import request, error
-from nltk.chunk import conlltags2tree, tree2conlltags
-from geopy.geocoders import Nominatim
-from geopy.extra.rate_limiter import RateLimiter
+from urllib import request, error, parse
+from elementslab.Analyst import GeoBoundary
 import geopandas as gpd
 import osmnx as ox
 import pandas as pd
@@ -27,9 +25,10 @@ import selenium.webdriver as webdriver
 from Learning.Scraping import Scraper
 from Statistics.basic_stats import normalize
 from Visualization import polar_chart as pc
+from bs4 import BeautifulSoup
 from craigslist import CraigslistHousing
-import geopy
-from nltk import word_tokenize, pos_tag, ne_chunk
+from geopy.geocoders import Nominatim
+from nltk import word_tokenize
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 from pdfminer.converter import TextConverter
@@ -37,17 +36,11 @@ from pdfminer.layout import LAParams
 from pdfminer.pdfinterp import PDFResourceManager, PDFPageInterpreter
 from pdfminer.pdfpage import PDFPage
 from selenium.webdriver.firefox.options import Options
-from shapely import affinity
 from shapely import wkt
 from shapely.geometry import *
-from shapely.ops import split
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.preprocessing import LabelEncoder
-from elementslab.Geospatial import BritishColumbia, Canada
-import requests
-import bs4
-from bs4 import BeautifulSoup
 
 
 class GeoScraper:
@@ -64,6 +57,7 @@ class GeoScraper:
         return self
 
     def employment_indeed(self, n_pages=3):
+        print(f"Downloading employment posts from Indeed")
 
         # Build search
         name = self.city.municipality.replace(',', '%2C').replace(' ', '+')
@@ -90,14 +84,13 @@ class GeoScraper:
                     page1 = requests.get(f"https://www.indeed.ca/{a['href']}")
                     soup1 = BeautifulSoup(page1.text, "html.parser")
                     for div1 in soup1.find_all(name="div", attrs={"class": "jobsearch-JobMetadataFooter"}):
-                        for i in div1.find_all(name="span", attrs={"class": "icl-u-lg-inline icl-u-xs-hide"}):
-                            p_days = div1.find_all(text=True)[1]
-                            for j in p_days.split():
-                                try:
-                                    result = float(j)
-                                    break
-                                except: result = 0
-                            data['time'].append(f"{datetime.datetime.now().date()-datetime.timedelta(days=result)} - {datetime.datetime.now()}")
+                        p_days = div1.find_all(text=True)[1]
+                        for j in p_days.split():
+                            try:
+                                result = float(j)
+                                break
+                            except: result = 0
+                        data['time'].append(f"{datetime.datetime.now().date()-datetime.timedelta(days=result)} - {datetime.datetime.now()}")
 
             # Extract salaries
             for div in soup.find_all(name="div", attrs={"class": "row"}):
@@ -165,7 +158,7 @@ class GeoScraper:
                 locator = Nominatim(user_agent="myGeocoder")
                 try: geom = Point(locator.geocode(f"{address}, {self.city.municipality}")[1])
                 except:
-                    try: geom = Point(locator.geocode(f"{address}")[1])
+                    try: geom = Point(locator.geocode(f"{address}, {self.city.city_name}")[1])
                     except: geom = 'Unknown'
                 data['geometry'].append(geom)
 
@@ -175,15 +168,18 @@ class GeoScraper:
         # Export to GeoPackage
         gdf = gpd.GeoDataFrame().from_dict(data)
         gdf = gdf.loc[gdf['geometry'] != 'Unknown']
-        gdf.set_geometry(gdf.geometry, drop=True, inplace=True)
+        gdf.geometry = [Point(t.y, t.x) for t in gdf.geometry]
         gdf.crs = 4326
         gdf.to_crs(epsg=self.city.crs, inplace=True)
+        self.city.boundary.to_crs(epsg=self.city.crs, inplace=True)
         try:
             gdf0 = gpd.read_file(self.city.gpkg, layer='indeed_employment')
             gdf = pd.concat([gdf0, gdf])
         except: pass
         gdf.drop_duplicates(inplace=True)
+        gdf = gpd.overlay(gdf, self.city.boundary)
         gdf.to_file(self.city.gpkg, layer='indeed_employment')
+        print(f"> Employment data downloaded from Indeed")
         return self
 
     def housing_craigslist(self, site, n_results):
@@ -343,7 +339,7 @@ class GeoScraper:
         return None
 
     # Scrape health and safety indicators
-    def air_quality(self):
+    def air_quality(self, token):
         """
         A Python wrapper for AQICN API.
         The library can be used to search and retrieve Air Quality Index data.
@@ -460,111 +456,256 @@ class GeoScraper:
         return print('done')
 
     # Scrape accessibility and social diversity indicators
-    def movement_osm_gps(self):
-        print(f"Downloading {self.city.municipality}'s public GPS traces from OpenStreetMaps")
-        area = self.city.boundary.geometry.to_crs(epsg=4326).geometry.area[0]
-        boundaries = [self.city.boundary.to_crs(epsg=4326).geometry[0]]
-        directory = f"{self.city.directory}Databases/osm/{self.city.municipality}"
-        if os.path.exists(directory): pass
-        else: os.mkdir(directory)
+    def movement_osm_gps(self, run=True):
+        if run:
+            print(f"Downloading {self.city.municipality}'s public GPS traces from OpenStreetMaps")
+            area = self.city.boundary.geometry.to_crs(epsg=4326).geometry.area[0]
+            boundaries = [self.city.boundary.to_crs(epsg=4326).geometry[0]]
+            directory = f"{self.city.directory}Databases/osm/{self.city.municipality}"
+            if os.path.exists(directory): pass
+            else: os.mkdir(directory)
 
-        while area > 0.25:
-            out_bounds = []
-            # Break each boundary into four parts
-            for b in boundaries:
-                cutter = MultiLineString([
-                    LineString([(b.bounds[0]-0.1, b.centroid.y), (b.bounds[2]+0.1, b.centroid.y)]),
-                    LineString([(b.centroid.x, b.bounds[1]-0.1), (b.centroid.x, b.bounds[3]+0.1)])
-                ]).buffer(0.000001)
-                boundaries = b.difference(cutter)
-                out_bounds = out_bounds + [b for b in boundaries]
-            # Check area of the bounding box of each splitted part (out_bounds)
-            bbox_areas = [Polygon([
-                Point(b.bounds[0], b.bounds[1]),
-                Point(b.bounds[0], b.bounds[3]),
-                Point(b.bounds[2], b.bounds[3]),
-                Point(b.bounds[2], b.bounds[1])
-            ]).area for b in out_bounds]
+            while area > 0.25:
+                out_bounds = []
+                # Break each boundary into four parts
+                for b in boundaries:
+                    cutter = MultiLineString([
+                        LineString([(b.bounds[0]-0.1, b.centroid.y), (b.bounds[2]+0.1, b.centroid.y)]),
+                        LineString([(b.centroid.x, b.bounds[1]-0.1), (b.centroid.x, b.bounds[3]+0.1)])
+                    ]).buffer(0.000001)
+                    boundaries = b.difference(cutter)
+                    out_bounds = out_bounds + [b for b in boundaries]
+                # Check area of the bounding box of each splitted part (out_bounds)
+                bbox_areas = [Polygon([
+                    Point(b.bounds[0], b.bounds[1]),
+                    Point(b.bounds[0], b.bounds[3]),
+                    Point(b.bounds[2], b.bounds[3]),
+                    Point(b.bounds[2], b.bounds[1])
+                ]).area for b in out_bounds]
 
-            area = max(bbox_areas)
-            if area < 0.25:
-                boundaries = out_bounds
-                print(f"Area too big, dividing boundary into {len(out_bounds)} polygons")
-                break
-
-        try: gdf = gpd.read_file(self.city.gpkg, layer='gps_traces')
-        except: gdf = gpd.GeoDataFrame(columns=['file'])
-
-        for i, b in enumerate(boundaries):
-            min_ln, min_lt, max_ln, max_lt = b.bounds
-
-            # Verify existing files
-            try: init = int(max([float(k[2:-3]) for k in os.listdir(directory) if f"{i}_" in k])) + 1
-            except: init = 0
-
-            # Start downloading
-            for j in range(init, 100000):
-                page = j
-                url = f"http://api.openstreetmap.org/api/0.6/trackpoints?bbox={min_ln},{min_lt},{max_ln},{max_lt}&page={page}"
-                try:
-                    file_name = f"{i}_{page}.gpx"
-                    print(f"Saving trace from {url} to {directory}/{file_name}")
-
-                    u = request.urlopen(url)
-                    buffer = u.read()
-
-                    if len(buffer) < 300:
-                        print(f"File size of {len(buffer)} is too small, jumping to next space")
-                        break
-                    else:
-                        f = open(f"{directory}/{file_name}", 'wb')
-                        f.write(buffer)
-                        f.close()
-                        time.sleep(1)
-                        if file_name not in gdf['file'].unique():
-                            gdf1 = gpd.read_file(f"{directory}/{file_name}", layer='track_points')
-                            gdf1['file'] = file_name
-                            gdf1.crs = 4326
-                            gdf1.to_crs(epsg=self.city.crs, inplace=True)
-                            gdf = pd.concat([gdf, gdf1])
-                            gdf.drop_duplicates(inplace=True)
-                            gdf.to_file(self.city.gpkg, layer='gps_traces')
-                except error.HTTPError as e:
-                    print("Download stopped; HTTP Error - %s" % e.code)
+                area = max(bbox_areas)
+                if area < 0.25:
+                    boundaries = out_bounds
+                    print(f"Area too big, dividing boundary into {len(out_bounds)} polygons")
                     break
-        return gdf
 
-    def public_transit_reach(self, time=30):
+            try: gdf = gpd.read_file(self.city.gpkg, layer='gps_traces')
+            except: gdf = gpd.GeoDataFrame(columns=['file'])
 
-        return
+            for i, b in enumerate(boundaries):
+                min_ln, min_lt, max_ln, max_lt = b.bounds
+
+                # Verify existing files
+                try: init = int(max([float(k[2:-3]) for k in os.listdir(directory) if f"{i}_" in k])) + 1
+                except: init = 0
+
+                # Start downloading
+                for j in range(init, 100000):
+                    page = j
+                    url = f"http://api.openstreetmap.org/api/0.6/trackpoints?bbox={min_ln},{min_lt},{max_ln},{max_lt}&page={page}"
+                    try:
+                        file_name = f"{i}_{page}.gpx"
+                        print(f"Saving trace from {url} to {directory}/{file_name}")
+
+                        u = request.urlopen(url)
+                        buffer = u.read()
+
+                        if len(buffer) < 300:
+                            print(f"File size of {len(buffer)} is too small, jumping to next space")
+                            break
+                        else:
+                            f = open(f"{directory}/{file_name}", 'wb')
+                            f.write(buffer)
+                            f.close()
+                            time.sleep(1)
+                            if file_name not in gdf['file'].unique():
+                                gdf1 = gpd.read_file(f"{directory}/{file_name}", layer='track_points')
+                                gdf1['file'] = file_name
+                                gdf1.crs = 4326
+                                gdf1.to_crs(epsg=self.city.crs, inplace=True)
+                                gdf = pd.concat([gdf, gdf1])
+                                gdf.drop_duplicates(inplace=True)
+                                gdf.to_file(self.city.gpkg, layer='gps_traces')
+                    except error.HTTPError as e:
+                        print("Download stopped; HTTP Error - %s" % e.code)
+                        break
+            return gdf
+
+    def public_transit(self, run=True, date='2016-09-05'):
+        if run:
+            HOST = 'http://transit.land'
+
+            def _request(uri):
+                print(uri)
+                req = request.Request(uri)
+                req.add_header('Content-Type', 'application/json')
+                response = request.urlopen(req)
+                return json.loads(response.read())
+
+            def request2(endpoint, **data):
+                """Request with JSON response."""
+                return _request(
+                    '%s%s?%s' % (HOST, endpoint, parse.urlencode(data or {}))
+                )
+
+            def paginated(endpoint, key, **data):
+                """Request with paginated JSON response. Returns generator."""
+                response = request2(endpoint, **data)
+                while response:
+                    meta = response['meta']
+                    print('%s: %s -> %s' % (
+                        key,
+                        meta['offset'],
+                        meta['offset'] + meta['per_page']
+                    ))
+                    for entity in response[key]:
+                        yield entity
+                    if meta.get('next'):
+                        response = _request(meta.get('next'))
+                    else:
+                        response = None
+
+            def schedule_stop_pairs(**data):
+                """Request Schedule Stop Pairs."""
+                return paginated(
+                    '/api/v1/schedule_stop_pairs',
+                    'schedule_stop_pairs',
+                    **data
+                )
+
+            def stops_f(**data):
+                """Request Stops"""
+                return paginated(
+                    '/api/v1/stops',
+                    'stops',
+                    **data
+                )
+
+            def stop_f(onestop_id):
+                """Request a Stop by Onestop ID."""
+                return request2('/api/v1/stops/%s' % onestop_id)
+
+            def duration(t1, t2):
+                """Return the time between two HH:MM:SS times, in seconds."""
+                fmt = '%H:%M:%S'
+                t1 = datetime.datetime.strptime(t1, fmt)
+                t2 = datetime.datetime.strptime(t2, fmt)
+                return (t2 - t1).seconds
+
+                ##########################################################
+                ##### Count trips between stops, output GeoJSON      #####
+                ##########################################################
+
+            PER_PAGE = 500
+            BBOX = list(self.city.boundary.bounds.transpose()[0])
+
+            # [
+            #     -118.266168,
+            #     34.074479,
+            #     -118.205915,
+            #     34.037964
+            # ]
+
+            BETWEEN = [
+                '01:00:00',
+                '23:00:00'
+            ]
+
+            HOURS = duration(BETWEEN[0], BETWEEN[1]) / 3600.0
+            # Minimum vehicles per hour
+            # http://colorbrewer2.org/
+            COLORMAP = {
+                0: '#fef0d9',
+                3: '#fdcc8a',
+                6: '#fc8d59',
+                10: '#d7301f'
+            }
+
+            OUTFILE = f"{self.city.directory}Databases/TransitLand/{self.city.municipality}.geojson"
+            if os.path.exists(OUTFILE):
+                raise Exception("File exists: %s" % OUTFILE)
+
+            # Group SSPs by (origin, destination) and count
+            edges = {}
+            ssps = schedule_stop_pairs(
+                bbox=','.join(map(str, BBOX)),
+                origin_departure_between=','.join(BETWEEN),
+                date=date,
+                per_page=PER_PAGE
+            )
+            for ssp in ssps:
+                key = ssp['origin_onestop_id'], ssp['destination_onestop_id']
+                if key not in edges:
+                    edges[key] = 0
+                edges[key] += 1
+
+            # Get Stop geometries
+            stops = {}
+            for stop in stops_f(per_page=PER_PAGE, bbox=','.join(map(str, BBOX))):
+                stops[stop['onestop_id']] = stop
+
+            # Create GeoJSON Features
+            colorkeys = sorted(COLORMAP.keys())
+            features = []
+            edges_sorted = sorted(list(edges.items()), key=lambda x: x[1])
+            for (origin_onestop_id, destination_onestop_id), trips in edges_sorted:
+                # Origin and destination geometries
+                origin = stops.get(origin_onestop_id)
+                destination = stops.get(destination_onestop_id)
+                if not (origin and destination):
+                    # Outside bounding box
+                    continue
+                # Frequency is in trips per hour
+                frequency = trips / HOURS
+                frequency_class = [i for i in colorkeys if frequency >= i][-1]
+                print("Origin: %s Destination: %s Trips: %s Frequency: %s Freq. class: %s" % (
+                    origin_onestop_id,
+                    destination_onestop_id,
+                    trips,
+                    frequency,
+                    frequency_class
+                ))
+                # Create the GeoJSON Feature
+                features.append({
+                    "type": "Feature",
+                    "name": "%s -> %s" % (origin['name'], destination['name']),
+                    "properties": {
+                        "origin_onestop_id": origin_onestop_id,
+                        "destination_onestop_id": destination_onestop_id,
+                        "trips": trips,
+                        "frequency": frequency,
+                        "frequency_class": frequency_class,
+                        "stroke": COLORMAP[frequency_class],
+                        "stroke-width": frequency_class + 1,
+                        "stroke-opacity": 1.0
+                    },
+                    "geometry": {
+                        "type": "LineString",
+                        "coordinates": [
+                            origin['geometry']['coordinates'],
+                            destination['geometry']['coordinates']
+                        ]
+                    }
+                })
+
+            # Create the GeoJSON Feature Collection
+            fc = {
+                "type": "FeatureCollection",
+                "features": features
+            }
+
+            with open(OUTFILE, 'w', encoding='utf8') as outfile:
+                json.dump(fc, outfile, sort_keys=True, indent=4, ensure_ascii=False)
+
+            gdf = gpd.read_file(OUTFILE)
+
+            return print('> Public transit frequency downloaded and stored')
 
     def social_twitter(self):
         return self
 
     def social_instagram(self):
         return self
-
-    # Clean and structure
-    def get_gh_gravity(self, radius):
-        gdf = gpd.read_file(self.directory + '/' + self.buildings)
-        print(gdf)
-        for i in radius:
-            with open(self.directory + '/' + self.buildings + '_gravity' + str(i) + '.tsv') as tsv:
-                print(tsv)
-
-    def layers_from_files(self, file_format='.geojson'):
-        files = os.listdir(self.directory)
-        file_list = []
-        for i in files:
-            if i[-(len(file_format)):] == file_format:
-                file_list.append(i)
-        # Iterate over experiments
-        for i in file_list:
-            filepath = (self.directory + '/' + i)
-            buildings = gpd.read_file(filepath)
-            buildings.crs = {'init': 'epsg:26910'}
-            c_hull = buildings.unary_union.convex_hull
-        return file_list
 
     # Scrape bylaws and legislations
     def bylaws(self, url):
@@ -863,6 +1004,275 @@ class GeoScraper:
         # Generate livability wheels
         pc.generate_wheels(files_n, n_cols, filename='temp.html')
         return print('')
+
+
+class Canada:
+    def __init__(self, provinces):
+        self.provinces=provinces
+        self.cities = [province.cities for province in provinces]
+
+    def update_databases(self, census=True):
+        # Download dissemination areas from StatsCan
+        if census:
+            for province in self.provinces:
+                for city in province.cities:
+                    print(f"Downloading {city.city_name}'s dissemination area")
+                    profile_url = "https://www12.statcan.gc.ca/census-recensement/2016/dp-pd/hlt-fst/pd-pl/Tables/CompFile.cfm?Lang=Eng&T=1901&OFT=FULLCSV"
+                    boundary_url = "http://www12.statcan.gc.ca/census-recensement/2011/geo/bound-limit/files-fichiers/2016/lda_000b16a_e.zip"
+
+                    c_dir = f"{city.directory}StatsCan/"
+                    if not os.path.exists(c_dir): os.makedirs(c_dir)
+
+                    os.chdir(c_dir)
+
+                    # Get data from StatCan webpage
+                    download_file(profile_url, 'lda_profile.csv')
+                    download_file(boundary_url)
+
+                    # Open and reproject boundary file
+                    bfilename = boundary_url.split('/')[-1][:-4]
+                    archive = zipfile.ZipFile(f'{c_dir}{bfilename}.zip', 'r')
+                    archive.extractall(c_dir)
+                    census_da = gpd.read_file(f"{c_dir}{bfilename}.shp")
+                    census_da.to_crs({'init': 'epsg:26910'}, inplace=True)
+
+                    # Join DataFrames
+                    df = pd.read_csv(f'{c_dir}lda_profile.csv', encoding="ISO-8859-1")
+                    df['DAUID'] = df['Geographic code']
+                    jda = census_da.merge(df, on='DAUID')
+
+                    # Crop data to City boundary
+                    city.DAs = gpd.sjoin(jda, city.boundary)
+
+                    # Get Journey to Work data
+                    if not os.path.exists(f"{c_dir}Mobility"): os.makedirs(f"{c_dir}Mobility")
+                    os.chdir(f"{c_dir}Mobility")
+                    mob_df = pd.DataFrame()
+                    for da, csd in zip(city.DAs['DAUID'], city.DAs['CSDUID']):
+                        print(f"Downloading Journey to Work data for DA: {csd}-{da}")
+                        base_link = f'https://www12.statcan.gc.ca/census-recensement/2016/dp-pd/prof/details/download-telecharger/current-actuelle.cfm?Lang=E&Geo1=DA&Code1={da}&Geo2=CSD&Code2={csd}&B1=Journey%20to%20work&type=0&FILETYPE=CSV'
+                        try:
+                            download_file(base_link, f"{csd}-{da}.csv")
+                        except:
+                            pass
+
+                        # Preprocess Journey to Work data
+                        df = pd.read_csv(f"{csd}-{da}.csv")
+                        df = df.loc['Main mode of commuting']['Unnamed: 0']
+                        dic = {i[0]: [i[2]] for i in df.index}
+                        df = pd.DataFrame.from_dict(dic)
+                        df['DAUID'] = da
+
+                        # Append data to gdf
+                        mob_df = pd.concat([mob_df, df])
+
+                    # Join data to dissemination areas
+                    city.DAs = city.DAs.merge(mob_df, on='DAUID')
+
+                    # Save it to GeoPackage
+                    city.DAs.to_file(city.gpkg, layer='land_dissemination_area')
+                    print(f'Census dissemination area downloaded and saved at {city.gpkg}')
+
+
+class BritishColumbia:
+    def __init__(self, cities):
+        self.cities = [GeoBoundary(f"{city}, British Columbia") for city in cities]
+
+    def update_databases(self, icbc=True):
+
+        # Check if ICBC crash data exists and join it from ICBC database if not
+        if icbc:
+            for city in self.cities:
+                try:
+                    city.crashes = gpd.read_file(city.gpkg, layer='network_accidents')
+                    print(city.city_name + ' ICBC data read from database')
+                except:
+                    source = 'https://public.tableau.com/profile/icbc#!/vizhome/LowerMainlandCrashes/LMDashboard'
+                    print('Adding ICBC crash data to ' + city.city_name + ' database')
+                    df = city.merge_csv(f"{city.directory}Databases/ICBC/")
+                    geometry = [Point(xy) for xy in zip(df['Longitude'], df['Latitude'])]
+                    gdf = gpd.GeoDataFrame(df, geometry=geometry)
+                    gdf.crs = 4326
+                    gdf.to_crs(epsg=city.crs, inplace=True)
+                    city.boundary.to_crs(epsg=city.crs, inplace=True)
+                    matches = gpd.sjoin(gdf, city.boundary, op='within')
+                    matches.to_file(city.gpkg, layer='icbc_accidents', driver='GPKG')
+
+    # BC Assessment
+    def aggregate_bca_from_field(self, run=True, inventory_dir='', geodatabase_dir=''):
+        if run:
+            for city in self.cities:
+                print('Geoprocessing BC Assessment data from JUROL number')
+                inventory = inventory_dir
+                df = pd.read_csv(inventory)
+
+                # Load and process Roll Number field on both datasets
+                gdf = gpd.read_file(geodatabase_dir, layer='ASSESSMENT_FABRIC')
+
+                # Reproject coordinate system
+                gdf.crs = {'init': 'epsg:3005'}
+                gdf.to_crs(epsg=city.crs, inplace=True)
+                city.boundary.to_crs(epsg=city.crs, inplace=True)
+
+                # Create spatial index and perform join
+                s_index = gdf.sindex
+                gdf = gpd.sjoin(gdf, city.boundary, op='within')
+
+                # Change feature types
+                gdf['JUROL'] = gdf['JUROL'].astype(str)
+                gdf = gdf[gdf.geometry.area > 71]
+                df['JUR'] = df['JUR'].astype(int).astype(str)
+                df['ROLL_NUM'] = df['ROLL_NUM'].astype(str)
+                df['JUROL'] = df['JUR'] + df['ROLL_NUM']
+                print(f'BCA spatial layer loaded with {len(gdf)} parcels')
+
+                # Merge by JUROL field
+                merged = pd.merge(gdf, df, on='JUROL')
+                full_gdfs = {'0z': merged}
+                print(f": {len(full_gdfs['0z'])}")
+
+                # Test merge with variations of JUROL
+                for i in range(1, 7):
+                    strings = []
+                    for n in range(i):
+                        strings.append('0')
+                    string = str(''.join(strings))
+                    df[string + 'z'] = string
+                    df['JUROL'] = df['JUR'] + string + df['ROLL_NUM']
+                    full_gdf = pd.merge(gdf, df, on='JUROL')
+                    full_gdf.drop([string + 'z'], axis=1)
+                    if len(full_gdf) > 0:
+                        full_gdfs[str(i) + 'z'] = full_gdf
+                    print(f"string: {len(full_gdf)}")
+
+                # Merge and export spatial and non-spatial datasets
+                out_gdf = pd.concat(full_gdfs.values(), ignore_index=True)
+                print(len(out_gdf))
+
+                # Reclassify land uses for BC Assessment data
+                uses = {
+                    'residential': ['000 - Single Family Dwelling', '030 - Strata-Lot Residence (Condominium)',
+                                    '032 - Residential Dwelling with Suite',
+                                    '033 - Duplex, Non-Strata Side by Side or Front / Back',
+                                    '034 - Duplex, Non-Strata Up / Down', '035 - Duplex, Strata Side by Side',
+                                    '036 - Duplex, Strata Front / Back', '039 - Row Housing (Single Unit Ownership)',
+                                    '037 - Manufactured Home (Within Manufactured Home Park)',
+                                    '038 - Manufactured Home (Not In Manufactured Home Park)',
+                                    '040 - Seasonal Dwelling',
+                                    '041 - Duplex, Strata Up / Down', '047 - Triplex', '049 - Fourplex',
+                                    '050 - Multi-Family (Apartment Block)',
+                                    '052 - Multi-Family (Garden Apartment & Row Housing)', '053 - Multi-Family (Conversion)',
+                                    '054 - Multi-Family (High-Rise)', '055 - Multi-Family (Minimal Commercial)',
+                                    '056 - Multi-Family (Residential Hotel)', '057 - Stratified Rental Townhouse',
+                                    '058 - Stratified Rental Apartment (Frame Construction)',
+                                    '059 - Stratified Rental Apartment (Hi-Rise Construction)',
+                                    '060 - 2 Acres Or More (Single Family Dwelling, Duplex)', '285 - Seniors Licensed Care',
+                                    '062 - 2 Acres Or More (Seasonal Dwelling)',
+                                    '063 - 2 Acres Or More (Manufactured Home)',
+                                    '234 - Manufactured Home Park',
+                                    '286 - Seniors Independent & Assisted Living'],
+                    'vacant': ['001 - Vacant Residential Less Than 2 Acres', '051 - Multi-Family (Vacant)',
+                               '061 - 2 Acres Or More (Vacant)', '201 - Vacant IC&I',
+                               '421 - Vacant', '422 - IC&I Water Lot (Vacant)',
+                               '601 - Civic, Institutional & Recreational (Vacant)'],
+                    'parking': ['020 - Residential Outbuilding Only', '029 - Strata Lot (Parking Residential)',
+                                '043 - Parking (Lot Only, Paved Or Gravel-Res)', '219 - Strata Lot (Parking Commercial)',
+                                '260 - Parking (Lot Only, Paved Or Gravel-Com)', '262 - Parking Garage',
+                                '490 - Parking Lot Only (Paved Or Gravel)'],
+                    'other': ['002 - Property Subject To Section 19(8)', '070 - 2 Acres Or More (Outbuilding)', '190 - Other',
+                              '200 - Store(S) And Service Commercial', '205 - Big Box', '216 - Commercial Strata-Lot',
+                              '220 - Automobile Dealership', '222 - Service Station', '224 - Self-Serve Service Station',
+                              '226 - Car Wash', '227 - Automobile Sales (Lot)', '228 - Automobile Paint Shop, Garages, Etc.',
+                              '230 - Hotel', '232 - Motel & Auto Court', '233 - Individual Strata Lot (Hotel/Motel)',
+                              '237 - Bed & Breakfast Operation 4 Or More Units',
+                              '239 - Bed & Breakfast Operation Less Than 4 Units',
+                              '240 - Greenhouses And Nurseries (Not Farm Class)', '257 - Fast Food Restaurants',
+                              '258 - Drive-In Restaurant', '288 - Sign Or Billboard Only'],
+                    'retail': ['202 - Store(S) And Living Quarters', '209 - Shopping Centre (Neighbourhood)',
+                               '211 - Shopping Centre (Community)', '212 - Department Store - Stand Alone',
+                               '213 - Shopping Centre (Regional)', '214 - Retail Strip', '215 - Food Market',
+                               '225 - Convenience Store/Service Station'],
+                    'entertainment': ['236 - Campground (Commercial)', '250 - Theatre Buildings',
+                                      '254 - Neighbourhood Pub', '256 - Restaurant Only',
+                                      '266 - Bowling Alley', '270 - Hall (Community, Lodge, Club, Etc.)',
+                                      '280 - Marine Facilities (Marina)',
+                                      '600 - Recreational & Cultural Buildings (Includes Curling',
+                                      '610 - Parks & Playing Fields', '612 - Golf Courses (Includes Public & Private)',
+                                      '654 - Recreational Clubs, Ski Hills',
+                                      '660 - Land Classified Recreational Used For'],
+                    'civic': ['210 - Bank', '620 - Government Buildings (Includes Courthouse, Post Office',
+                              '625 - Garbage Dumps, Sanitary Fills, Sewer Lagoons, Etc.', '630 - Works Yards',
+                              '634 - Government Research Centres (Includes Nurseries &',
+                              '640 - Hospitals (Nursing Homes Refer To Commercial Section).',
+                              '642 - Cemeteries (Includes Public Or Private).',
+                              '650 - Schools & Universities, College Or Technical Schools',
+                              '652 - Churches & Bible Schools'],
+                    'agriculture': ['110 - Grain & Forage', '120 - Vegetable & Truck',
+                                    '150 - Beef', '170 - Poultry', '180 - Mixed'],
+                    'office': ['203 - Stores And/Or Offices With Apartments', '204 - Store(S) And Offices',
+                               '208 - Office Building (Primary Use)'],
+                    'industrial': ['217 - Air Space Title', '272 - Storage & Warehousing (Open)',
+                                   '273 - Storage & Warehousing (Closed)', '274 - Storage & Warehousing (Cold)',
+                                   '275 - Self Storage', '276 - Lumber Yard Or Building Supplies', '400 - Fruit & Vegetable',
+                                   '401 - Industrial (Vacant)', '402 - Meat & Poultry', '403 - Sea Food',
+                                   '404 - Dairy Products', '405 - Bakery & Biscuit Manufacturing',
+                                   '406 - Confectionery Manufacturing & Sugar Processing', '408 - Brewery',
+                                   '414 - Miscellaneous (Food Processing)',
+                                   '416 - Planer Mills (When Separate From Sawmill)',
+                                   '419 - Sash & Door',
+                                   '420 - Lumber Remanufacturing (When Separate From Sawmill)',
+                                   '423 - IC&I Water Lot (Improved)',
+                                   '424 - Pulp & Paper Mills (Incl Fine Paper, Tissue & Asphalt Roof)',
+                                   '425 - Paper Box, Paper Bag, And Other Paper Remanufacturing.', '428 - Improved',
+                                   '429 - Miscellaneous (Forest And Allied Industry)',
+                                   '434 - Petroleum Bulk Plants',
+                                   '445 - Sand & Gravel (Vacant and Improved)',
+                                   '447 - Asphalt Plants',
+                                   '448 - Concrete Mixing Plants',
+                                   '449 - Miscellaneous (Mining And Allied Industries)', '452 - Leather Industry',
+                                   '454 - Textiles & Knitting Mills', '456 - Clothing Industry',
+                                   '458 - Furniture & Fixtures Industry', '460 - Printing & Publishing Industry',
+                                   '462 - Primary Metal Industries (Iron & Steel Mills,', '464 - Metal Fabricating Industries',
+                                   '466 - Machinery Manufacturing (Excluding Electrical)',
+                                   '470 - Electrical & Electronics Products Industry',
+                                   '472 - Chemical & Chemical Products Industries', '474 - Miscellaneous & (Industrial Other)',
+                                   '476 - Grain Elevators', '478 - Docks & Wharves', '500 - Railway',
+                                   '505 - Marine & Navigational Facilities (Includes Ferry',
+                                   '510 - Bus Company, Including Street Railway', '520 - Telephone',
+                                   '530 - Telecommunications (Other Than Telephone)',
+                                   '550 - Gas Distribution Systems',
+                                   '560 - Water Distribution Systems',
+                                   '580 - Electrical Power Systems (Including Non-Utility']
+                }
+                new_uses = []
+                index = list(out_gdf.columns).index("PRIMARY_ACTUAL_USE")
+                all_prim_uses = [item for sublist in list(uses.values()) for item in sublist]
+                for row in out_gdf.iterrows():
+                    for key, value in uses.items():
+                        if row[1]['PRIMARY_ACTUAL_USE'] in value:
+                            new_uses.append(key)
+                    if row[1]['PRIMARY_ACTUAL_USE'] not in all_prim_uses:
+                        new_uses.append(row[1]['PRIMARY_ACTUAL_USE'])
+                out_gdf['elab_use'] = new_uses
+
+                # Export assessment fabric layer to GeoPackage
+                out_gdf.to_file(city.gpkg, driver='GPKG', layer='land_assessment_fabric')
+
+                # Delete repeated parcels
+                p_gdf = out_gdf.drop_duplicates(subset=['geometry'])
+
+                # Classify parcels into categories
+                p_gdf['area'] = p_gdf.geometry.area
+                p_gdf.loc[p_gdf['area'] < 400, 'elab_size'] = '-400'
+                p_gdf.loc[(p_gdf['area'] > 400) & (p_gdf['area'] < 800), 'elab_size'] = '400-800'
+                p_gdf.loc[(p_gdf['area'] > 800) & (p_gdf['area'] < 1600), 'elab_size'] = '800-1600'
+                p_gdf.loc[(p_gdf['area'] > 1600) & (p_gdf['area'] < 3200), 'elab_size'] = '1600-3200'
+                p_gdf.loc[(p_gdf['area'] > 3200) & (p_gdf['area'] < 6400), 'elab_size'] = '3200-6400'
+                p_gdf.loc[p_gdf['area'] > 6400, 'elab_size'] = '6400-'
+
+                # Export parcel layer to GeoPackage
+                p_gdf.to_file(city.gpkg, driver='GPKG', layer='land_assessment_parcels')
+                return {'properties': out_gdf, 'parcels': p_gdf}
 
 
 class Vancouver:
