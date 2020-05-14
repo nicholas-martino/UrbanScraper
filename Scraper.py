@@ -1,11 +1,29 @@
 # -*- coding: utf-8 -*-
 """
-Created on Tue Jan  8 13:52:23 2019
+MIT License
 
-@author: nicholas-martino (C) MIT License
+Copyright (c) 2020 Nicholas Martino
 
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 """
 
+import zipfile
 import datetime
 import glob
 import io
@@ -41,6 +59,19 @@ from shapely.geometry import *
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.preprocessing import LabelEncoder
+
+
+def download_file(url, file_path):
+    # NOTE the stream=True parameter below
+    with requests.get(url, stream=True) as r:
+        r.raise_for_status()
+        with open(file_path, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                # If you have chunk encoded response uncomment if
+                # and set chunk_size parameter to None.
+                #if chunk:
+                f.write(chunk)
+    return file_path
 
 
 class GeoScraper:
@@ -83,14 +114,17 @@ class GeoScraper:
                     # Extract time stamps
                     page1 = requests.get(f"https://www.indeed.ca/{a['href']}")
                     soup1 = BeautifulSoup(page1.text, "html.parser")
-                    for div1 in soup1.find_all(name="div", attrs={"class": "jobsearch-JobMetadataFooter"}):
-                        p_days = div1.find_all(text=True)[1]
-                        for j in p_days.split():
-                            try:
-                                result = float(j)
-                                break
-                            except: result = 0
-                        data['time'].append(f"{datetime.datetime.now().date()-datetime.timedelta(days=result)} - {datetime.datetime.now()}")
+                    footer = soup1.find_all(name="div", attrs={"class": "jobsearch-JobMetadataFooter"})
+                    if len(footer) == 0: data['time'].append('Unknown')
+                    else:
+                        for div1 in footer:
+                            p_days = div1.find_all(text=True)[1]
+                            for j in p_days.split():
+                                try:
+                                    result = float(j)
+                                    break
+                                except: result = 0
+                            data['time'].append(f"{datetime.datetime.now().date()-datetime.timedelta(days=result)} - {datetime.datetime.now()}")
 
             # Extract salaries
             for div in soup.find_all(name="div", attrs={"class": "row"}):
@@ -166,9 +200,11 @@ class GeoScraper:
         s.driver.close()
 
         # Export to GeoPackage
-        gdf = gpd.GeoDataFrame().from_dict(data)
+        try: gdf = gpd.GeoDataFrame().from_dict(data)
+        except: pass
         gdf = gdf.loc[gdf['geometry'] != 'Unknown']
-        gdf.geometry = [Point(t.y, t.x) for t in gdf.geometry]
+        gdf['geometry'] = [Point(t.y, t.x) for t in gdf.geometry]
+        gdf = gdf.set_geometry('geometry')
         gdf.crs = 4326
         gdf.to_crs(epsg=self.city.crs, inplace=True)
         self.city.boundary.to_crs(epsg=self.city.crs, inplace=True)
@@ -598,19 +634,10 @@ class GeoScraper:
 
             PER_PAGE = 500
             BBOX = list(self.city.boundary.bounds.transpose()[0])
-
-            # [
-            #     -118.266168,
-            #     34.074479,
-            #     -118.205915,
-            #     34.037964
-            # ]
-
             BETWEEN = [
                 '01:00:00',
                 '23:00:00'
             ]
-
             HOURS = duration(BETWEEN[0], BETWEEN[1]) / 3600.0
             # Minimum vehicles per hour
             # http://colorbrewer2.org/
@@ -1032,14 +1059,14 @@ class Canada:
 
                     # Get data from StatCan webpage
                     download_file(profile_url, 'lda_profile.csv')
-                    download_file(boundary_url)
+                    download_file(boundary_url, 'lda_000b16a_e.zip')
 
                     # Open and reproject boundary file
                     bfilename = boundary_url.split('/')[-1][:-4]
                     archive = zipfile.ZipFile(f'{c_dir}{bfilename}.zip', 'r')
                     archive.extractall(c_dir)
                     census_da = gpd.read_file(f"{c_dir}{bfilename}.shp")
-                    census_da.to_crs({'init': 'epsg:26910'}, inplace=True)
+                    census_da.to_crs(city.crs, inplace=True)
 
                     # Join DataFrames
                     df = pd.read_csv(f'{c_dir}lda_profile.csv', encoding="ISO-8859-1")
@@ -1047,6 +1074,7 @@ class Canada:
                     jda = census_da.merge(df, on='DAUID')
 
                     # Crop data to City boundary
+                    city.boundary.to_crs(city.crs, inplace=True)
                     city.DAs = gpd.sjoin(jda, city.boundary)
 
                     # Get Journey to Work data
@@ -1056,10 +1084,8 @@ class Canada:
                     for da, csd in zip(city.DAs['DAUID'], city.DAs['CSDUID']):
                         print(f"Downloading Journey to Work data for DA: {csd}-{da}")
                         base_link = f'https://www12.statcan.gc.ca/census-recensement/2016/dp-pd/prof/details/download-telecharger/current-actuelle.cfm?Lang=E&Geo1=DA&Code1={da}&Geo2=CSD&Code2={csd}&B1=Journey%20to%20work&type=0&FILETYPE=CSV'
-                        try:
-                            download_file(base_link, f"{csd}-{da}.csv")
-                        except:
-                            pass
+                        try: download_file(base_link, f"{csd}-{da}.csv")
+                        except: pass
 
                         # Preprocess Journey to Work data
                         df = pd.read_csv(f"{csd}-{da}.csv")
@@ -1072,7 +1098,18 @@ class Canada:
                         mob_df = pd.concat([mob_df, df])
 
                     # Join data to dissemination areas
-                    city.DAs = city.DAs.merge(mob_df, on='DAUID')
+                    city.DAs = city.DAs.merge(mob_df, on='DAUID', suffixes=[None, None]).fillna(0)
+                    total = city.DAs.loc[:, ['  Car; truck; van - as a driver',
+                                          '  Car; truck; van - as a passenger',
+                                          '  Public transit',
+                                          '  Walked', '  Bicycle', '  Other method']].astype(int)
+                    total = total.fillna(0).astype(int).sum(axis=1).replace(0, 1)
+                    city.DAs['walk'] = city.DAs['  Walked'].astype(int) / total
+                    city.DAs['bike'] = city.DAs['  Bicycle'].astype(int) / total
+                    city.DAs['drive'] = (city.DAs['  Car; truck; van - as a driver'].astype(int) + \
+                                         city.DAs['  Car; truck; van - as a passenger'].astype(int)) \
+                                         / total
+                    city.DAs['bus'] = city.DAs['  Public transit'].astype(int) / total
 
                     # Save it to GeoPackage
                     city.DAs.to_file(city.gpkg, layer='land_dissemination_area')
@@ -1104,180 +1141,281 @@ class BritishColumbia:
                     matches.to_file(city.gpkg, layer='icbc_accidents', driver='GPKG')
 
     # BC Assessment
-    def aggregate_bca_from_field(self, run=True, inventory_dir='', geodatabase_dir=''):
+    def aggregate_bca_from_field(self, run=True, join=True, classify=True, inventory_dir='', geodatabase_dir=''):
         if run:
             for city in self.cities:
-                print('Geoprocessing BC Assessment data from JUROL number')
-                inventory = inventory_dir
-                df = pd.read_csv(inventory)
+                if join:
+                    print('> Geoprocessing BC Assessment data from JUROL number')
+                    inventory = inventory_dir
+                    df = pd.read_csv(inventory)
 
-                # Load and process Roll Number field on both datasets
-                gdf = gpd.read_file(geodatabase_dir, layer='ASSESSMENT_FABRIC')
+                    # Load and process Roll Number field on both datasets
+                    gdf = gpd.read_file(geodatabase_dir, layer='ASSESSMENT_FABRIC')
 
-                # Reproject coordinate system
-                gdf.crs = {'init': 'epsg:3005'}
-                gdf.to_crs(epsg=city.crs, inplace=True)
-                city.boundary.to_crs(epsg=city.crs, inplace=True)
+                    # Reproject coordinate system
+                    gdf.crs = 3005
+                    gdf.to_crs(epsg=city.crs, inplace=True)
+                    city.boundary.to_crs(epsg=city.crs, inplace=True)
 
-                # Create spatial index and perform join
-                s_index = gdf.sindex
-                gdf = gpd.sjoin(gdf, city.boundary, op='within')
+                    # Create spatial index and perform join
+                    s_index = gdf.sindex
+                    gdf = gpd.sjoin(gdf, city.boundary, op='within')
 
-                # Change feature types
-                gdf['JUROL'] = gdf['JUROL'].astype(str)
-                gdf = gdf[gdf.geometry.area > 71]
-                df['JUR'] = df['JUR'].astype(int).astype(str)
-                df['ROLL_NUM'] = df['ROLL_NUM'].astype(str)
-                df['JUROL'] = df['JUR'] + df['ROLL_NUM']
-                print(f'BCA spatial layer loaded with {len(gdf)} parcels')
+                    # Change feature types
+                    gdf['JUROL'] = gdf['JUROL'].astype(str)
+                    gdf = gdf[gdf.geometry.area > 71]
+                    df['JUR'] = df['JUR'].astype(int).astype(str)
+                    df['ROLL_NUM'] = df['ROLL_NUM'].astype(str)
+                    df['JUROL'] = df['JUR'] + df['ROLL_NUM']
+                    print(f'BCA spatial layer loaded with {len(gdf)} parcels')
 
-                # Merge by JUROL field
-                merged = pd.merge(gdf, df, on='JUROL')
-                full_gdfs = {'0z': merged}
-                print(f": {len(full_gdfs['0z'])}")
+                    # Merge by JUROL field
+                    merged = pd.merge(gdf, df, on='JUROL')
+                    full_gdfs = {'0z': merged}
+                    print(f": {len(full_gdfs['0z'])}")
 
-                # Test merge with variations of JUROL
-                for i in range(1, 7):
-                    strings = []
-                    for n in range(i):
-                        strings.append('0')
-                    string = str(''.join(strings))
-                    df[string + 'z'] = string
-                    df['JUROL'] = df['JUR'] + string + df['ROLL_NUM']
-                    full_gdf = pd.merge(gdf, df, on='JUROL')
-                    full_gdf.drop([string + 'z'], axis=1)
-                    if len(full_gdf) > 0:
-                        full_gdfs[str(i) + 'z'] = full_gdf
-                    print(f"string: {len(full_gdf)}")
+                    # Test merge with variations of JUROL
+                    for i in range(1, 7):
+                        strings = []
+                        for n in range(i):
+                            strings.append('0')
+                        string = str(''.join(strings))
+                        df[string + 'z'] = string
+                        df['JUROL'] = df['JUR'] + string + df['ROLL_NUM']
+                        full_gdf = pd.merge(gdf, df, on='JUROL')
+                        full_gdf.drop([string + 'z'], axis=1)
+                        if len(full_gdf) > 0:
+                            full_gdfs[str(i) + 'z'] = full_gdf
+                        print(f"string: {len(full_gdf)}")
 
-                # Merge and export spatial and non-spatial datasets
-                out_gdf = pd.concat(full_gdfs.values(), ignore_index=True)
-                print(len(out_gdf))
+                    # Merge and export spatial and non-spatial datasets
+                    out_gdf = pd.concat(full_gdfs.values(), ignore_index=True)
+                    out_gdf.to_file(city.gpkg, driver='GPKG', layer='land_assessment_fabric')
+                    print(len(out_gdf))
 
-                # Reclassify land uses for BC Assessment data
-                uses = {
-                    'residential': ['000 - Single Family Dwelling', '030 - Strata-Lot Residence (Condominium)',
-                                    '032 - Residential Dwelling with Suite',
-                                    '033 - Duplex, Non-Strata Side by Side or Front / Back',
-                                    '034 - Duplex, Non-Strata Up / Down', '035 - Duplex, Strata Side by Side',
-                                    '036 - Duplex, Strata Front / Back', '039 - Row Housing (Single Unit Ownership)',
-                                    '037 - Manufactured Home (Within Manufactured Home Park)',
-                                    '038 - Manufactured Home (Not In Manufactured Home Park)',
-                                    '040 - Seasonal Dwelling',
-                                    '041 - Duplex, Strata Up / Down', '047 - Triplex', '049 - Fourplex',
-                                    '050 - Multi-Family (Apartment Block)',
-                                    '052 - Multi-Family (Garden Apartment & Row Housing)', '053 - Multi-Family (Conversion)',
-                                    '054 - Multi-Family (High-Rise)', '055 - Multi-Family (Minimal Commercial)',
-                                    '056 - Multi-Family (Residential Hotel)', '057 - Stratified Rental Townhouse',
-                                    '058 - Stratified Rental Apartment (Frame Construction)',
-                                    '059 - Stratified Rental Apartment (Hi-Rise Construction)',
-                                    '060 - 2 Acres Or More (Single Family Dwelling, Duplex)', '285 - Seniors Licensed Care',
-                                    '062 - 2 Acres Or More (Seasonal Dwelling)',
-                                    '063 - 2 Acres Or More (Manufactured Home)',
-                                    '234 - Manufactured Home Park',
-                                    '286 - Seniors Independent & Assisted Living'],
-                    'vacant': ['001 - Vacant Residential Less Than 2 Acres', '051 - Multi-Family (Vacant)',
-                               '061 - 2 Acres Or More (Vacant)', '201 - Vacant IC&I',
-                               '421 - Vacant', '422 - IC&I Water Lot (Vacant)',
-                               '601 - Civic, Institutional & Recreational (Vacant)'],
-                    'parking': ['020 - Residential Outbuilding Only', '029 - Strata Lot (Parking Residential)',
-                                '043 - Parking (Lot Only, Paved Or Gravel-Res)', '219 - Strata Lot (Parking Commercial)',
-                                '260 - Parking (Lot Only, Paved Or Gravel-Com)', '262 - Parking Garage',
-                                '490 - Parking Lot Only (Paved Or Gravel)'],
-                    'other': ['002 - Property Subject To Section 19(8)', '070 - 2 Acres Or More (Outbuilding)', '190 - Other',
-                              '200 - Store(S) And Service Commercial', '205 - Big Box', '216 - Commercial Strata-Lot',
-                              '220 - Automobile Dealership', '222 - Service Station', '224 - Self-Serve Service Station',
-                              '226 - Car Wash', '227 - Automobile Sales (Lot)', '228 - Automobile Paint Shop, Garages, Etc.',
-                              '230 - Hotel', '232 - Motel & Auto Court', '233 - Individual Strata Lot (Hotel/Motel)',
-                              '237 - Bed & Breakfast Operation 4 Or More Units',
-                              '239 - Bed & Breakfast Operation Less Than 4 Units',
-                              '240 - Greenhouses And Nurseries (Not Farm Class)', '257 - Fast Food Restaurants',
-                              '258 - Drive-In Restaurant', '288 - Sign Or Billboard Only'],
-                    'retail': ['202 - Store(S) And Living Quarters', '209 - Shopping Centre (Neighbourhood)',
-                               '211 - Shopping Centre (Community)', '212 - Department Store - Stand Alone',
-                               '213 - Shopping Centre (Regional)', '214 - Retail Strip', '215 - Food Market',
-                               '225 - Convenience Store/Service Station'],
-                    'entertainment': ['236 - Campground (Commercial)', '250 - Theatre Buildings',
-                                      '254 - Neighbourhood Pub', '256 - Restaurant Only',
-                                      '266 - Bowling Alley', '270 - Hall (Community, Lodge, Club, Etc.)',
-                                      '280 - Marine Facilities (Marina)',
-                                      '600 - Recreational & Cultural Buildings (Includes Curling',
-                                      '610 - Parks & Playing Fields', '612 - Golf Courses (Includes Public & Private)',
-                                      '654 - Recreational Clubs, Ski Hills',
-                                      '660 - Land Classified Recreational Used For'],
-                    'civic': ['210 - Bank', '620 - Government Buildings (Includes Courthouse, Post Office',
-                              '625 - Garbage Dumps, Sanitary Fills, Sewer Lagoons, Etc.', '630 - Works Yards',
-                              '634 - Government Research Centres (Includes Nurseries &',
-                              '640 - Hospitals (Nursing Homes Refer To Commercial Section).',
-                              '642 - Cemeteries (Includes Public Or Private).',
-                              '650 - Schools & Universities, College Or Technical Schools',
-                              '652 - Churches & Bible Schools'],
-                    'agriculture': ['110 - Grain & Forage', '120 - Vegetable & Truck',
-                                    '150 - Beef', '170 - Poultry', '180 - Mixed'],
-                    'office': ['203 - Stores And/Or Offices With Apartments', '204 - Store(S) And Offices',
-                               '208 - Office Building (Primary Use)'],
-                    'industrial': ['217 - Air Space Title', '272 - Storage & Warehousing (Open)',
-                                   '273 - Storage & Warehousing (Closed)', '274 - Storage & Warehousing (Cold)',
-                                   '275 - Self Storage', '276 - Lumber Yard Or Building Supplies', '400 - Fruit & Vegetable',
-                                   '401 - Industrial (Vacant)', '402 - Meat & Poultry', '403 - Sea Food',
-                                   '404 - Dairy Products', '405 - Bakery & Biscuit Manufacturing',
-                                   '406 - Confectionery Manufacturing & Sugar Processing', '408 - Brewery',
-                                   '414 - Miscellaneous (Food Processing)',
-                                   '416 - Planer Mills (When Separate From Sawmill)',
-                                   '419 - Sash & Door',
-                                   '420 - Lumber Remanufacturing (When Separate From Sawmill)',
-                                   '423 - IC&I Water Lot (Improved)',
-                                   '424 - Pulp & Paper Mills (Incl Fine Paper, Tissue & Asphalt Roof)',
-                                   '425 - Paper Box, Paper Bag, And Other Paper Remanufacturing.', '428 - Improved',
-                                   '429 - Miscellaneous (Forest And Allied Industry)',
-                                   '434 - Petroleum Bulk Plants',
-                                   '445 - Sand & Gravel (Vacant and Improved)',
-                                   '447 - Asphalt Plants',
-                                   '448 - Concrete Mixing Plants',
-                                   '449 - Miscellaneous (Mining And Allied Industries)', '452 - Leather Industry',
-                                   '454 - Textiles & Knitting Mills', '456 - Clothing Industry',
-                                   '458 - Furniture & Fixtures Industry', '460 - Printing & Publishing Industry',
-                                   '462 - Primary Metal Industries (Iron & Steel Mills,', '464 - Metal Fabricating Industries',
-                                   '466 - Machinery Manufacturing (Excluding Electrical)',
-                                   '470 - Electrical & Electronics Products Industry',
-                                   '472 - Chemical & Chemical Products Industries', '474 - Miscellaneous & (Industrial Other)',
-                                   '476 - Grain Elevators', '478 - Docks & Wharves', '500 - Railway',
-                                   '505 - Marine & Navigational Facilities (Includes Ferry',
-                                   '510 - Bus Company, Including Street Railway', '520 - Telephone',
-                                   '530 - Telecommunications (Other Than Telephone)',
-                                   '550 - Gas Distribution Systems',
-                                   '560 - Water Distribution Systems',
-                                   '580 - Electrical Power Systems (Including Non-Utility']
-                }
-                new_uses = []
-                index = list(out_gdf.columns).index("PRIMARY_ACTUAL_USE")
-                all_prim_uses = [item for sublist in list(uses.values()) for item in sublist]
-                for row in out_gdf.iterrows():
-                    for key, value in uses.items():
-                        if row[1]['PRIMARY_ACTUAL_USE'] in value:
-                            new_uses.append(key)
-                    if row[1]['PRIMARY_ACTUAL_USE'] not in all_prim_uses:
-                        new_uses.append(row[1]['PRIMARY_ACTUAL_USE'])
-                out_gdf['elab_use'] = new_uses
+                if classify:
+                    print("> Classifying land uses and parcel categories from BC Assessment")
+                    if not join: out_gdf = gpd.read_file(city.gpkg, driver='GPKG', layer='land_assessment_fabric')
 
-                # Export assessment fabric layer to GeoPackage
-                out_gdf.to_file(city.gpkg, driver='GPKG', layer='land_assessment_fabric')
+                    # Reclassify land uses for BC Assessment data
+                    uses = {
+                        'residential': ['000 - Single Family Dwelling', '030 - Strata-Lot Residence (Condominium)',
+                                        '032 - Residential Dwelling with Suite',
+                                        '033 - Duplex, Non-Strata Side by Side or Front / Back',
+                                        '034 - Duplex, Non-Strata Up / Down', '035 - Duplex, Strata Side by Side',
+                                        '036 - Duplex, Strata Front / Back', '039 - Row Housing (Single Unit Ownership)',
+                                        '037 - Manufactured Home (Within Manufactured Home Park)',
+                                        '038 - Manufactured Home (Not In Manufactured Home Park)',
+                                        '040 - Seasonal Dwelling',
+                                        '041 - Duplex, Strata Up / Down', '047 - Triplex', '049 - Fourplex',
+                                        '050 - Multi-Family (Apartment Block)',
+                                        '052 - Multi-Family (Garden Apartment & Row Housing)', '053 - Multi-Family (Conversion)',
+                                        '054 - Multi-Family (High-Rise)', '055 - Multi-Family (Minimal Commercial)',
+                                        '056 - Multi-Family (Residential Hotel)', '057 - Stratified Rental Townhouse',
+                                        '058 - Stratified Rental Apartment (Frame Construction)',
+                                        '059 - Stratified Rental Apartment (Hi-Rise Construction)',
+                                        '060 - 2 Acres Or More (Single Family Dwelling, Duplex)', '285 - Seniors Licensed Care',
+                                        '062 - 2 Acres Or More (Seasonal Dwelling)',
+                                        '063 - 2 Acres Or More (Manufactured Home)',
+                                        '234 - Manufactured Home Park',
+                                        '284 - Seniors Strata - Care',
+                                        '284 - Seniors Strata - Care, Independent or Assisted Living',
+                                        '286 - Seniors Independent & Assisted Living'],
+                        'hospitality': ['042 - Strata-Lot Seasonal Dwelling (Condominium)',
+                                        '230 - Hotel', '232 - Motel & Auto Court',
+                                        '233 - Individual Strata Lot (Hotel/Motel)',
+                                        '237 - Bed & Breakfast Operation 4 Or More Units',
+                                        '239 - Bed & Breakfast Operation Less Than 4 Units',
+                                        '238 - Seasonal Resort'],
+                        'vacant': ['001 - Vacant Residential Less Than 2 Acres', '051 - Multi-Family (Vacant)',
+                                   '061 - 2 Acres Or More (Vacant)',
+                                   '111 - Grain & Forage (Vacant)',
+                                   '121 - Vegetable & Truck (Vacant)',
+                                   '201 - Vacant IC&I',
+                                   '421 - Vacant', '422 - IC&I Water Lot (Vacant)',
+                                   '601 - Civic, Institutional & Recreational (Vacant)'],
+                        'parking': ['020 - Residential Outbuilding Only', '029 - Strata Lot (Parking Residential)',
+                                    '043 - Parking (Lot Only, Paved Or Gravel-Res)', '219 - Strata Lot (Parking Commercial)',
+                                    '260 - Parking (Lot Only, Paved Or Gravel-Com)', '262 - Parking Garage',
+                                    '490 - Parking Lot Only (Paved Or Gravel)'],
+                        'other': ['002 - Property Subject To Section 19(8)', '070 - 2 Acres Or More (Outbuilding)', '190 - Other',
+                                  '200 - Store(S) And Service Commercial', '205 - Big Box',
+                                  '220 - Automobile Dealership', '222 - Service Station', '224 - Self-Serve Service Station',
+                                  '226 - Car Wash', '227 - Automobile Sales (Lot)', '228 - Automobile Paint Shop, Garages, Etc.',
+                                  '240 - Greenhouses And Nurseries (Not Farm Class)',
+                                  '258 - Drive-In Restaurant', '288 - Sign Or Billboard Only',
+                                  '590 - Miscellaneous (Transportation & Communication)',
+                                  '615 - Government Reserves',
+                                  '615 - Government Reserves (Includes Greenbelts (Not In Farm',
+                                  '632 - Ranger Station'],
+                        'retail': ['202 - Store(S) And Living Quarters', '206 - Neighbourhood Store',
+                                   '209 - Shopping Centre (Neighbourhood)',
+                                   '211 - Shopping Centre (Community)', '212 - Department Store - Stand Alone',
+                                   '213 - Shopping Centre (Regional)', '214 - Retail Strip', '215 - Food Market',
+                                   '216 - Commercial Strata-Lot',
+                                   '225 - Convenience Store/Service Station'],
+                        'entertainment': ['236 - Campground (Commercial)', '250 - Theatre Buildings',
+                                          '254 - Neighbourhood Pub', '256 - Restaurant Only',
+                                          '257 - Fast Food Restaurants',
+                                          '266 - Bowling Alley', '270 - Hall (Community, Lodge, Club, Etc.)',
+                                          '280 - Marine Facilities (Marina)',
+                                          '600 - Recreational & Cultural Buildings (Includes Curling',
+                                          '610 - Parks & Playing Fields', '612 - Golf Courses (Includes Public & Private)',
+                                          '614 - Campgrounds',
+                                          '614 - Campgrounds (Includes Government Campgrounds, Ymca &',
+                                          '654 - Recreational Clubs, Ski Hills',
+                                          '660 - Land Classified Recreational Used For'],
+                        'civic': ['210 - Bank', '540 - Community Antenna Television'
+                                  '620 - Government Buildings (Includes Courthouse, Post Office',
+                                  '625 - Garbage Dumps, Sanitary Fills, Sewer Lagoons, Etc.', '630 - Works Yards',
+                                  '634 - Government Research Centres (Includes Nurseries &',
+                                  '640 - Hospitals (Nursing Homes Refer To Commercial Section).',
+                                  '642 - Cemeteries (Includes Public Or Private).',
+                                  '650 - Schools & Universities, College Or Technical Schools',
+                                  '652 - Churches & Bible Schools'],
+                        'agriculture': ['110 - Grain & Forage', '111 - Grain & Forage',
+                                        '120 - Vegetable & Truck', '130 - Tree Fruits',
+                                        '140 - Small Fruits', '150 - Beef', '160 - Dairy', '170 - Poultry', '180 - Mixed',
+                                        '409 - Winery'],
+                        'office': ['203 - Stores And/Or Offices With Apartments', '204 - Store(S) And Offices',
+                                   '208 - Office Building (Primary Use)',
+                                   '620 - Government Buildings (Includes Courthouse, Post Office'],
+                        'industrial': ['031 - Strata-Lot Self Storage-Res Use',
+                                       '217 - Air Space Title',
+                                       '218 - Strata-Lot Self Storage-Business Use',
+                                       '272 - Storage & Warehousing (Open)',
+                                       '273 - Storage & Warehousing (Closed)', '274 - Storage & Warehousing (Cold)',
+                                       '275 - Self Storage', '276 - Lumber Yard Or Building Supplies',
+                                       '300 - Stratified Operational Facility Areas',
+                                       '400 - Fruit & Vegetable',
+                                       '401 - Industrial (Vacant)', '402 - Meat & Poultry', '403 - Sea Food',
+                                       '404 - Dairy Products', '405 - Bakery & Biscuit Manufacturing',
+                                       '406 - Confectionery Manufacturing & Sugar Processing', '408 - Brewery',
+                                       '414 - Miscellaneous (Food Processing)',
+                                       '415 - Sawmills',
+                                       '416 - Planer Mills (When Separate From Sawmill)',
+                                       '418 - Shingle Mills',
+                                       '419 - Sash & Door',
+                                       '420 - Lumber Remanufacturing (When Separate From Sawmill)',
+                                       '423 - IC&I Water Lot (Improved)',
+                                       '424 - Pulp & Paper Mills (Incl Fine Paper, Tissue & Asphalt Roof)',
+                                       '425 - Paper Box, Paper Bag, And Other Paper Remanufacturing.',
+                                       '426 - Logging Operations, Incl Log Storage',
+                                       '428 - Improved',
+                                       '429 - Miscellaneous (Forest And Allied Industry)',
+                                       '434 - Petroleum Bulk Plants',
+                                       '445 - Sand & Gravel (Vacant and Improved)',
+                                       '447 - Asphalt Plants',
+                                       '448 - Concrete Mixing Plants',
+                                       '449 - Miscellaneous (Mining And Allied Industries)', '452 - Leather Industry',
+                                       '454 - Textiles & Knitting Mills', '456 - Clothing Industry',
+                                       '458 - Furniture & Fixtures Industry', '460 - Printing & Publishing Industry',
+                                       '462 - Primary Metal Industries (Iron & Steel Mills,', '464 - Metal Fabricating Industries',
+                                       '466 - Machinery Manufacturing (Excluding Electrical)',
+                                       '470 - Electrical & Electronics Products Industry',
+                                       '472 - Chemical & Chemical Products Industries', '474 - Miscellaneous & (Industrial Other)',
+                                       '476 - Grain Elevators', '478 - Docks & Wharves', '480 - Shipyards','500 - Railway',
+                                       '505 - Marine & Navigational Facilities (Includes Ferry',
+                                       '510 - Bus Company, Including Street Railway', '520 - Telephone',
+                                       '530 - Telecommunications (Other Than Telephone)',
+                                       '515 - Airports, Heliports, Etc.',
+                                       '540 - Community Antenna Television (Cablevision)',
+                                       '550 - Gas Distribution Systems',
+                                       '560 - Water Distribution Systems',
+                                       '580 - Electrical Power Systems (Including Non-Utility']
+                    }
 
-                # Delete repeated parcels
-                p_gdf = out_gdf.drop_duplicates(subset=['geometry'])
+                    # Broaden 'other' uses for a better accuracy on diversity indexes
+                    uses['other'] = uses['other'] + uses['vacant'] + uses['parking'] + uses['agriculture'] + uses['industrial']
+                    uses['vacant'], uses['parking'], uses['agriculture'], uses['industrial'] = [], [], [], []
 
-                # Classify parcels into categories
-                p_gdf['area'] = p_gdf.geometry.area
-                p_gdf.loc[p_gdf['area'] < 400, 'elab_size'] = '-400'
-                p_gdf.loc[(p_gdf['area'] > 400) & (p_gdf['area'] < 800), 'elab_size'] = '400-800'
-                p_gdf.loc[(p_gdf['area'] > 800) & (p_gdf['area'] < 1600), 'elab_size'] = '800-1600'
-                p_gdf.loc[(p_gdf['area'] > 1600) & (p_gdf['area'] < 3200), 'elab_size'] = '1600-3200'
-                p_gdf.loc[(p_gdf['area'] > 3200) & (p_gdf['area'] < 6400), 'elab_size'] = '3200-6400'
-                p_gdf.loc[p_gdf['area'] > 6400, 'elab_size'] = '6400-'
+                    new_uses = []
+                    index = list(out_gdf.columns).index("PRIMARY_ACTUAL_USE")
+                    all_prim_uses = [item for sublist in list(uses.values()) for item in sublist]
+                    for row in out_gdf.iterrows():
+                        for key, value in uses.items():
+                            if row[1]['PRIMARY_ACTUAL_USE'] in value:
+                                new_uses.append(key)
+                        if row[1]['PRIMARY_ACTUAL_USE'] not in all_prim_uses:
+                            new_uses.append(row[1]['PRIMARY_ACTUAL_USE'])
+                    out_gdf['n_use'] = new_uses
 
-                # Export parcel layer to GeoPackage
-                p_gdf.to_file(city.gpkg, driver='GPKG', layer='land_assessment_parcels')
-                return {'properties': out_gdf, 'parcels': p_gdf}
+                    # Export assessment fabric layer to GeoPackage
+                    out_gdf.to_file(city.gpkg, driver='GPKG', layer='land_assessment_fabric')
+
+                    # Delete repeated parcels
+                    p_gdf = out_gdf.drop_duplicates(subset=['geometry'])
+
+                    # Classify parcels into categories
+                    p_gdf.loc[:, 'area'] = p_gdf.loc[:, 'geometry'].area
+                    p_gdf.loc[p_gdf['area'] < 400, 'n_size'] = 'less than 400'
+                    p_gdf.loc[(p_gdf['area'] > 400) & (p_gdf['area'] < 800), 'n_size'] = '400 to 800'
+                    p_gdf.loc[(p_gdf['area'] > 800) & (p_gdf['area'] < 1600), 'n_size'] = '800 to 1600'
+                    p_gdf.loc[(p_gdf['area'] > 1600) & (p_gdf['area'] < 3200), 'n_size'] = '1600 to 3200'
+                    p_gdf.loc[(p_gdf['area'] > 3200) & (p_gdf['area'] < 6400), 'n_size'] = '3200 to 6400'
+                    p_gdf.loc[p_gdf['area'] > 6400, 'n_size'] = 'more than 6400'
+
+                    # Convert area to square km
+                    p_gdf.loc[:, 'area_sqkm'] = p_gdf.loc[:, 'geometry'].area/100000
+
+                    # Export parcel layer to GeoPackage
+                    p_gdf = p_gdf.drop('area', axis=1)
+                    p_gdf['geometry'] = p_gdf['geometry'].buffer(0)
+
+                    # Export geojson and read again to try to export to GeoPackage
+                    p_gdf.to_file(city.gpkg, driver='GPKG', layer='land_assessment_parcels')
+                    return print("> Data aggregation from BC Assessment finished in {elapsed} minutes")
+
+    # BC Transit
+    def get_bc_transit(self, urls, run=True, down=True):
+        if run:
+            if len(urls) != len(self.cities): print("Number of urls and BC cities must be the same")
+            else:
+                for city, url in zip(self.cities, urls):
+                    dir = f'{city.directory}Databases/BCTransit'
+                    if down:
+                        print(f"Downloading transit data from BC Transit for {city.municipality}")
+                        extension = filename.split('.')[len(filename.split('.'))-1]
+                        zip_path = f'{dir}/{city.municipality}.{extension}'
+                        filename = download_file(url, file_path=zip_path)
+                        os.rename(f'{dir}/{filename}', zip_path)
+
+                    # Create directory if it doesn't exist
+                    n_dir = f"{dir}/{city.municipality}"
+                    if os.path.exists(n_dir): pass
+                    else: os.mkdir(n_dir)
+
+                    if down:
+                        # Unzip data and delete file
+                        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                            zip_ref.extractall(n_dir)
+                        os.remove(zip_path)
+
+                    # Read stops and stop_times
+                    stops = pd.read_csv(f"{n_dir}/stops.txt")
+                    stops.set_index('stop_id')
+                    times = pd.read_csv(f"{n_dir}/stop_times.txt")
+                    calen = pd.read_csv(f"{n_dir}/calendar_dates.txt")
+
+                    # Calculate frequency of trips on each stop
+                    for stop in times['stop_id'].unique():
+                        s_df = times.loc[times['stop_id'] == stop]
+                        n_trips = len(s_df['trip_id'].unique())
+                        frequency = n_trips/len(calen)
+                        stops.at[stop, 'n_trips'] = n_trips
+                        stops.at[stop,'frequency'] = frequency
+                        print(f"> Stop {stop} processed with {n_trips} trips at a frequency of {frequency} trips per day")
+
+                    # Create stop geometries
+                    stops['geometry'] = [Point(lon, lat) for lon, lat in zip(stops.stop_lon, stops.stop_lat)]
+                    stops_gdf = gpd.GeoDataFrame(stops, geometry='geometry')
+
+                    # Reproject and export
+                    stops_gdf.crs = 4326
+                    stops_gdf = stops_gdf.to_crs(city.crs)
+                    stops_gdf.to_file(city.gpkg, layer='transit_stops')
+
+        return
 
 
 class Vancouver:
