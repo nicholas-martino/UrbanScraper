@@ -24,7 +24,9 @@ SOFTWARE.
 """
 
 import zipfile
+import timeit
 import datetime
+import numpy as np
 import glob
 import io
 import json
@@ -78,6 +80,7 @@ class GeoScraper:
     """Web scraping GeoSpatial data"""
     def __init__(self, city):
         self.city = city
+        print(f"Scraping data for elements within {city.municipality}\n")
 
     # Scrape built environment
     def buildings_osm(self):
@@ -148,8 +151,9 @@ class GeoScraper:
                         data['company'].append(span.text.strip())
 
             # Clean street names from OSM
+            c_links = gpd.read_file(self.city.gpkg, layer='network_links')
             cl_strs = [i.replace("Avenue", "").replace("Street", "").replace("Road", "").replace("Drive", "").strip(" ")
-                       for i in list(self.city.links.name.unique()) if i is not None]
+                       for i in list(c_links) if i is not None]
 
             # Match locations from job names
             rec_locs = []
@@ -214,7 +218,9 @@ class GeoScraper:
         except: pass
         gdf.drop_duplicates(inplace=True)
         gdf = gpd.overlay(gdf, self.city.boundary)
-        gdf.to_file(self.city.gpkg, layer='indeed_employment')
+
+        try: gdf.to_file(self.city.gpkg, layer='indeed_employment')
+        except: pass
         print(f"> Employment data downloaded from Indeed")
         return self
 
@@ -541,7 +547,7 @@ class GeoScraper:
                     url = f"http://api.openstreetmap.org/api/0.6/trackpoints?bbox={min_ln},{min_lt},{max_ln},{max_lt}&page={page}"
                     try:
                         file_name = f"{i}_{page}.gpx"
-                        print(f"Saving trace from {url} to {directory}/{file_name}")
+                        print(f"Saving trace {file_name} from {url}")
 
                         u = request.urlopen(url)
                         buffer = u.read()
@@ -1078,38 +1084,216 @@ class Canada:
                     city.DAs = gpd.sjoin(jda, city.boundary)
 
                     # Get Journey to Work data
-                    if not os.path.exists(f"{c_dir}Mobility"): os.makedirs(f"{c_dir}Mobility")
-                    os.chdir(f"{c_dir}Mobility")
-                    mob_df = pd.DataFrame()
-                    for da, csd in zip(city.DAs['DAUID'], city.DAs['CSDUID']):
-                        print(f"Downloading Journey to Work data for DA: {csd}-{da}")
-                        base_link = f'https://www12.statcan.gc.ca/census-recensement/2016/dp-pd/prof/details/download-telecharger/current-actuelle.cfm?Lang=E&Geo1=DA&Code1={da}&Geo2=CSD&Code2={csd}&B1=Journey%20to%20work&type=0&FILETYPE=CSV'
-                        try: download_file(base_link, f"{csd}-{da}.csv")
-                        except: pass
+                    if not os.path.exists(f"{c_dir}DAs"): os.makedirs(f"{c_dir}DAs")
+                    os.chdir(f"{c_dir}DAs")
+                    out_df = pd.DataFrame()
+                    for i, (da, csd) in enumerate(zip(city.DAs['DAUID'], city.DAs['CSDUID'])):
+                        print(f"DA: {da} ({i+1} / {len(city.DAs['DAUID'])+1})")
+                        for data in ['Education', 'Housing', 'Income', 'Journey%20to%20work', 'Labour']:
 
-                        # Preprocess Journey to Work data
-                        df = pd.read_csv(f"{csd}-{da}.csv")
+                            print(f"> Downloading {data}")
+                            base_url = f'https://www12.statcan.gc.ca/census-recensement/2016/dp-pd/prof/details/download-telecharger/current-actuelle.cfm?Lang=E&Geo1=DA&Code1={da}&Geo2=CSD&Code2={csd}&B1={data}&type=0&FILETYPE=CSV'
+                            try: download_file(base_url, f"{csd}-{da}-{data}.csv")
+                            except:
+                                print(f"> Download from {data} data failed for DA {da} at CSD {csd}")
+                                pass
+
+                        # Pre process base funcion
+                        clean = lambda df: df['Unnamed: 1'].reset_index().loc[:, ['level_1', 'level_3']]\
+                            .iloc[1:].set_index('level_1').transpose().reset_index(drop=True)
+
+                        # Pre process Education
+                        df = pd.read_csv(f"{csd}-{da}-Education.csv")
+                        df_ed = clean(df)
+                        df_ed_degrees = df_ed.iloc[:, 1:5]
+                        df_ed_areas = df_ed.iloc[: , 32:93].loc[:, [
+                            '  No postsecondary certificate; diploma or degree',
+                            '  Education',
+                            '  Visual and performing arts; and communications technologies',
+                            '  Humanities', '  Social and behavioural sciences and law',
+                            '  Business; management and public administration',
+                            '  Physical and life sciences and technologies',
+                            '  Mathematics; computer and information sciences',
+                            '  Architecture; engineering; and related technologies',
+                            '  Agriculture; natural resources and conservation',
+                            '  Health and related fields',
+                            '  Personal; protective and transportation services',
+                            '  Other'
+                        ]]
+                        df_ed = pd.concat([df_ed_degrees, df_ed_areas], axis=1)
+                        df_ed = df_ed.rename(columns={
+                            'Total - Highest certificate; diploma or degree for the population aged 15 years and over in private households - 25% sample data': 'ed_total',
+                            '  No certificate; diploma or degree': 'no_certificate',
+                            '  Secondary (high) school diploma or equivalency certificate': 'secondary',
+                            '  Postsecondary certificate; diploma or degree': 'postsecondary',
+                            '  No postsecondary certificate; diploma or degree': 'no_postsecondary',
+                            '  Education': 'education',
+                            '  Visual and performing arts; and communications technologies': 'arts',
+                            '  Humanities': 'humanities',
+                            '  Social and behavioural sciences and law': 'social',
+                            '  Business; management and public administration': 'business',
+                            '  Physical and life sciences and technologies': 'natural',
+                            '  Mathematics; computer and information sciences': 'information',
+                            '  Architecture; engineering; and related technologies': 'engineering',
+                            '  Agriculture; natural resources and conservation': 'agriculture',
+                            '  Health and related fields': 'health',
+                            '  Personal; protective and transportation services': 'protective',
+                            '  Other': 'other'
+                        }).astype(float, errors='ignore')
+                        df_ed['no_certificate_ratio'] = df_ed['no_certificate']/df_ed['ed_total']
+                        df_ed['secondary_ratio'] = df_ed['secondary']/df_ed['ed_total']
+                        df_ed['postsecondary_ratio'] = df_ed['postsecondary']/df_ed['ed_total']
+                        df_ed['no_postsecondary_ratio'] = df_ed['no_postsecondary']/df_ed['ed_total']
+                        df_ed['DAUID'] = da
+
+                        # Pre process Housing
+                        df = pd.read_csv(f"{csd}-{da}-Housing.csv")
+                        df_ho = clean(df)
+                        df_ho_gen = df_ho.iloc[:, 1:35]
+                        df_ho_aff = df_ho.iloc[:, 58:67]
+                        df_ho = pd.concat([df_ho_gen, df_ho_aff], axis=1)
+                        # Filter null columns
+                        df_ho = df_ho.loc[:, df_ho.columns.notnull()]
+                        # Clean columns names
+                        n_cols = []
+                        for col in df_ho.columns:
+                            try: n_cols.append(col.strip())
+                            except: n_cols.append(col)
+                        df_ho.columns = n_cols
+                        # Rename columns and convert to numeric
+                        df_ho = df_ho.rename(columns={
+                            'Total - Private households by tenure - 25% sample data':'total_tenure',
+                            'Total - Occupied private dwellings by condominium status - 25% sample data':'total_cond',
+                            'Total - Occupied private dwellings by number of bedrooms - 25% sample data':'total_bedr',
+                            'Total - Occupied private dwellings by number of rooms - 25% sample data':'total_rooms',
+                            'Average number of rooms per dwelling':'ave_n_rooms',
+                            'Total - Private households by number of persons per room - 25% sample data':'total_people_per_room',
+                            'Total - Private households by housing suitability - 25% sample data':'total_suitability',
+                            'Total - Occupied private dwellings by period of construction - 25% sample data':'total_period',
+                            'Median monthly shelter costs for owned dwellings ($)':'owned_med_cost',
+                            'Average monthly shelter costs for owned dwellings ($)':'owned_ave_cost',
+                            'Median value of dwellings ($)':'owned_med_dwe_value',
+                            'Average value of dwellings ($)':'owned_ave_dwe_value',
+                            'Total - Tenant households in non-farm; non-reserve private dwellings - 25% sample data':'total_tenant',
+                            '% of tenant households in subsidized housing':'receives_subsidy_rat',
+                            '% of tenant households spending 30% or more of its income on shelter costs':'more30%income_rat',
+                            'Median monthly shelter costs for rented dwellings ($)':'rented_med_cost',
+                            'Average monthly shelter costs for rented dwellings ($)':'rented_ave_cost'
+                            }).astype(float, errors='ignore')
+                        # Calculate ratios
+                        df_ho['owner_ratio'] = df_ho['Owner']/df_ho['total_tenure']
+                        df_ho['renter_ratio'] = df_ho['Renter']/df_ho['total_tenure']
+                        df_ho['condominium_ratio'] = df_ho['Condominium']/df_ho['total_cond']
+                        df_ho['not_condominium_ratio'] = df_ho['Not condominium']/df_ho['total_cond']
+                        df_ho['no_bedrooms_ratio'] = df_ho['No bedrooms']/df_ho['total_bedr']
+                        df_ho['1_bedroom_ratio'] = df_ho['1 bedroom']/df_ho['total_bedr']
+                        df_ho['2_bedrooms_ratio'] = df_ho['2 bedrooms']/df_ho['total_bedr']
+                        df_ho['3_bedrooms_ratio'] = df_ho['3 bedrooms']/df_ho['total_bedr']
+                        df_ho['4_plus_bedrooms_ratio'] = df_ho['4 or more bedrooms']/df_ho['total_bedr']
+                        df_ho['1_4_rooms_ratio'] = df_ho['1 to 4 rooms']/df_ho['total_rooms']
+                        df_ho['5_rooms_ratio'] = df_ho['5 rooms']/df_ho['total_rooms']
+                        df_ho['6_rooms_ratio'] = df_ho['6 rooms']/df_ho['total_rooms']
+                        df_ho['7_rooms_ratio'] = df_ho['7 rooms']/df_ho['total_rooms']
+                        df_ho['8_plus_rooms_ratio'] = df_ho['8 or more rooms']/df_ho['total_rooms']
+                        df_ho['1_person_per_room_ratio'] = df_ho['One person or fewer per room']/df_ho['total_people_per_room']
+                        df_ho['1_plus_person_per_room_ratio'] = df_ho['More than 1 person per room']/df_ho['total_people_per_room']
+                        df_ho['suitable_ratio'] = df_ho['Suitable']/df_ho['total_suitability']
+                        df_ho['not_suitable_ratio'] = df_ho['Not suitable'] / df_ho['total_suitability']
+                        df_ho['age_before_1960_ratio'] = df_ho['1960 or before']/df_ho['total_period']
+                        df_ho['age_1961_1980_ratio'] = df_ho['1961 to 1980']/df_ho['total_period']
+                        df_ho['age_1981_1990_ratio'] = df_ho['1981 to 1990']/df_ho['total_period']
+                        df_ho['age_1991_2000_ratio'] = df_ho['1991 to 2000']/df_ho['total_period']
+                        df_ho['age_2001_2005_ratio'] = df_ho['2001 to 2005']/df_ho['total_period']
+                        df_ho['age_2006_2010_ratio'] = df_ho['2006 to 2010']/df_ho['total_period']
+                        df_ho['age_2011_2016_ratio'] = df_ho['2011 to 2016']/df_ho['total_period']
+                        df_ho['DAUID'] = da
+
+                        # Pre process Income
+                        df = pd.read_csv(f"{csd}-{da}-Income.csv", encoding='ISO-8859-1')
+                        df_in = clean(df)
+                        df_in_stats = df_in.iloc[:, 2:13]
+                        df_in_empl_stats = df_in.iloc[:, 28:35]
+                        df_in_grp_aft_tax = df_in.iloc[:, 48:64]
+                        df_in = pd.concat([df_in_stats, df_in_empl_stats, df_in_grp_aft_tax], axis=1)
+                        df_in = df_in.rename(columns={
+                            '  Number of total income recipients aged 15 years and over in private households - 100% data':'income_recipients',
+                            '    Median total income in 2015 among recipients ($)':'median_income',
+                            '  Number of after-tax income recipients aged 15 years and over in private households - 100% data':'after_tax_recipients',
+                            '    Median after-tax income in 2015 among recipients ($)':'med_income_after_tax',
+                            '  Number of market income recipients aged 15 years and over in private households - 100% data':'mkt_recipients',
+                            '    Median market income in 2015 among recipients ($)':'med_mkt_income',
+                            '  Number of government transfers recipients aged 15 years and over in private households - 100% data':'n_gov_transfers',
+                            '    Median government transfers in 2015 among recipients ($)':'median_gov_transfers',
+                            '  Number of employment income recipients aged 15 years and over in private households - 100% data':'n_emp_income',
+                            '    Median employment income in 2015 among recipients ($)':'med_emp_income',
+                            'Total - Income statistics in 2015 for the population aged 15 years and over in private households - 25% sample data':'total_income_stats',
+                            '  Market income (%)':'mkt_income',
+                            '    Employment income (%)':'emp_income',
+                            '  Government transfers (%)':'gov_transfers',
+                            'Total - Total income groups in 2015 for the population aged 15 years and over in private households - 100% data':'total_income_groups',
+                            '  Without total income':'without_income',
+                            '  With total income':'with_income',
+                            '  Percentage with total income':'income_ratio',
+                            'Total - After-tax income groups in 2015 for the population aged 15 years and over in private households - 100% data':'total_income_after_tax',
+                            '  Without after-tax income':'without_income_at',
+                            '  With after-tax income':'with_income_at',
+                            '  Percentage with after-tax income':'income_ratio_at'
+                        }).astype(float, errors='ignore')
+                        df_in['DAUID'] = da
+
+                        # Pre process Journey to Work
+                        df = pd.read_csv(f"{csd}-{da}-Journey%20to%20work.csv")
                         df = df.loc['Main mode of commuting']['Unnamed: 0']
                         dic = {i[0]: [i[2]] for i in df.index}
-                        df = pd.DataFrame.from_dict(dic)
-                        df['DAUID'] = da
+                        df_jw = pd.DataFrame.from_dict(dic)
+                        df_jw['DAUID'] = da
+
+                        # Pre process Labour
+                        df = pd.read_csv(f"{csd}-{da}-Labour.csv", encoding='ISO-8859-1')
+                        df_lb = clean(df)
+                        n_cols = []
+                        for col in df_lb.columns:
+                            try: n_cols.append(col.strip())
+                            except: n_cols.append(col)
+                        df_lb.columns = n_cols
+                        df_lb_status = df_lb.iloc[:, 1:9]
+                        df_lb_class = df_lb.iloc[:, 15:20]
+                        df_lb_place = df_lb.iloc[:, 56:61]
+                        df_lb = pd.concat([df_lb_status, df_lb_class, df_lb_place], axis=1)
+                        df_lb = df_lb.rename(columns={
+                            'Total - Population aged 15 years and over by Labour force status - 25% sample data':'total_labour_force',
+                            'Total labour force aged 15 years and over by class of worker - 25% sample data':'total_class_worker',
+                            'Total - Place of work status for the employed labour force aged 15 years and over in private households - 25% sample data':'total_place'
+                        }).astype(float, errors='ignore')
+                        df_lb['worked_home_ratio'] = df_lb['Worked at home']/df_lb['total_place']
+                        df_lb['worked_abroad_ratio'] = df_lb['Worked outside Canada']/df_lb['total_place']
+                        df_lb['worked_flexible'] = df_lb['No fixed workplace address']/df_lb['total_place']
+                        df_lb['worked_usual_ratio'] = df_lb['Worked at usual place']/df_lb['total_place']
+                        df_lb['DAUID'] = da
 
                         # Append data to gdf
-                        mob_df = pd.concat([mob_df, df])
+                        joi_df = pd.concat([df_ed, df_ho, df_in, df_jw, df_lb], axis=1)
+                        out_df = pd.concat([out_df, joi_df], axis=0)
 
                     # Join data to dissemination areas
-                    city.DAs = city.DAs.merge(mob_df, on='DAUID', suffixes=[None, None]).fillna(0)
-                    total = city.DAs.loc[:, ['  Car; truck; van - as a driver',
-                                          '  Car; truck; van - as a passenger',
-                                          '  Public transit',
-                                          '  Walked', '  Bicycle', '  Other method']].astype(int)
-                    total = total.fillna(0).astype(int).sum(axis=1).replace(0, 1)
-                    city.DAs['walk'] = city.DAs['  Walked'].astype(int) / total
-                    city.DAs['bike'] = city.DAs['  Bicycle'].astype(int) / total
-                    city.DAs['drive'] = (city.DAs['  Car; truck; van - as a driver'].astype(int) + \
-                                         city.DAs['  Car; truck; van - as a passenger'].astype(int)) \
-                                         / total
-                    city.DAs['bus'] = city.DAs['  Public transit'].astype(int) / total
+                    out_df = out_df.loc[:, ~out_df.columns.duplicated()].reset_index(drop=True)
+                    city.DAs = city.DAs.merge(out_df, on='DAUID', suffixes=[None, None])
+                    mob_cols = ['  Car; truck; van - as a driver', '  Car; truck; van - as a passenger',
+                        '  Public transit', '  Walked', '  Bicycle', '  Other method']
+                    mob_df = city.DAs.loc[:, mob_cols]
+                    total = mob_df.dropna().astype(int).sum(axis=1)
+                    mob_df['DAUID'] = city.DAs.DAUID
+                    mob_df = mob_df.dropna().astype(int)
+
+                    # Calculate ratios
+                    ratios = pd.DataFrame()
+                    ratios['walk'] = mob_df['  Walked'] / total
+                    ratios['bike'] = mob_df['  Bicycle'] / total
+                    ratios['drive'] = (mob_df['  Car; truck; van - as a driver'] + \
+                        mob_df['  Car; truck; van - as a passenger']) / total
+                    ratios['bus'] = mob_df['  Public transit'] / total
+                    ratios['DAUID'] = mob_df['DAUID'].astype(str)
+                    city.DAs = city.DAs.merge(ratios, on='DAUID', suffixes=[None, None], how='outer')
 
                     # Save it to GeoPackage
                     city.DAs.to_file(city.gpkg, layer='land_dissemination_area')
@@ -1119,6 +1303,7 @@ class Canada:
 class BritishColumbia:
     def __init__(self, cities):
         self.cities = [GeoBoundary(f"{city}, British Columbia") for city in cities]
+        print("\n### Class British Columbia created ###\n\n")
 
     def update_databases(self, icbc=True):
 
@@ -1138,12 +1323,14 @@ class BritishColumbia:
                     gdf.to_crs(epsg=city.crs, inplace=True)
                     city.boundary.to_crs(epsg=city.crs, inplace=True)
                     matches = gpd.sjoin(gdf, city.boundary, op='within')
-                    matches.to_file(city.gpkg, layer='icbc_accidents', driver='GPKG')
+                    try: matches.to_file(city.gpkg, layer='icbc_accidents', driver='GPKG')
+                    except: pass
 
     # BC Assessment
     def aggregate_bca_from_field(self, run=True, join=True, classify=True, inventory_dir='', geodatabase_dir=''):
         if run:
             for city in self.cities:
+                start_time = timeit.default_timer()
                 if join:
                     print('> Geoprocessing BC Assessment data from JUROL number')
                     inventory = inventory_dir
@@ -1198,136 +1385,166 @@ class BritishColumbia:
                     if not join: out_gdf = gpd.read_file(city.gpkg, driver='GPKG', layer='land_assessment_fabric')
 
                     # Reclassify land uses for BC Assessment data
-                    uses = {
-                        'residential': ['000 - Single Family Dwelling', '030 - Strata-Lot Residence (Condominium)',
-                                        '032 - Residential Dwelling with Suite',
-                                        '033 - Duplex, Non-Strata Side by Side or Front / Back',
-                                        '034 - Duplex, Non-Strata Up / Down', '035 - Duplex, Strata Side by Side',
-                                        '036 - Duplex, Strata Front / Back', '039 - Row Housing (Single Unit Ownership)',
-                                        '037 - Manufactured Home (Within Manufactured Home Park)',
-                                        '038 - Manufactured Home (Not In Manufactured Home Park)',
-                                        '040 - Seasonal Dwelling',
-                                        '041 - Duplex, Strata Up / Down', '047 - Triplex', '049 - Fourplex',
-                                        '050 - Multi-Family (Apartment Block)',
-                                        '052 - Multi-Family (Garden Apartment & Row Housing)', '053 - Multi-Family (Conversion)',
-                                        '054 - Multi-Family (High-Rise)', '055 - Multi-Family (Minimal Commercial)',
-                                        '056 - Multi-Family (Residential Hotel)', '057 - Stratified Rental Townhouse',
-                                        '058 - Stratified Rental Apartment (Frame Construction)',
-                                        '059 - Stratified Rental Apartment (Hi-Rise Construction)',
-                                        '060 - 2 Acres Or More (Single Family Dwelling, Duplex)', '285 - Seniors Licensed Care',
-                                        '062 - 2 Acres Or More (Seasonal Dwelling)',
-                                        '063 - 2 Acres Or More (Manufactured Home)',
-                                        '234 - Manufactured Home Park',
-                                        '284 - Seniors Strata - Care',
-                                        '284 - Seniors Strata - Care, Independent or Assisted Living',
-                                        '286 - Seniors Independent & Assisted Living'],
-                        'hospitality': ['042 - Strata-Lot Seasonal Dwelling (Condominium)',
-                                        '230 - Hotel', '232 - Motel & Auto Court',
-                                        '233 - Individual Strata Lot (Hotel/Motel)',
-                                        '237 - Bed & Breakfast Operation 4 Or More Units',
-                                        '239 - Bed & Breakfast Operation Less Than 4 Units',
-                                        '238 - Seasonal Resort'],
-                        'vacant': ['001 - Vacant Residential Less Than 2 Acres', '051 - Multi-Family (Vacant)',
-                                   '061 - 2 Acres Or More (Vacant)',
-                                   '111 - Grain & Forage (Vacant)',
-                                   '121 - Vegetable & Truck (Vacant)',
-                                   '201 - Vacant IC&I',
-                                   '421 - Vacant', '422 - IC&I Water Lot (Vacant)',
-                                   '601 - Civic, Institutional & Recreational (Vacant)'],
-                        'parking': ['020 - Residential Outbuilding Only', '029 - Strata Lot (Parking Residential)',
-                                    '043 - Parking (Lot Only, Paved Or Gravel-Res)', '219 - Strata Lot (Parking Commercial)',
-                                    '260 - Parking (Lot Only, Paved Or Gravel-Com)', '262 - Parking Garage',
-                                    '490 - Parking Lot Only (Paved Or Gravel)'],
-                        'other': ['002 - Property Subject To Section 19(8)', '070 - 2 Acres Or More (Outbuilding)', '190 - Other',
-                                  '200 - Store(S) And Service Commercial', '205 - Big Box',
-                                  '220 - Automobile Dealership', '222 - Service Station', '224 - Self-Serve Service Station',
-                                  '226 - Car Wash', '227 - Automobile Sales (Lot)', '228 - Automobile Paint Shop, Garages, Etc.',
-                                  '240 - Greenhouses And Nurseries (Not Farm Class)',
-                                  '258 - Drive-In Restaurant', '288 - Sign Or Billboard Only',
-                                  '590 - Miscellaneous (Transportation & Communication)',
-                                  '615 - Government Reserves',
-                                  '615 - Government Reserves (Includes Greenbelts (Not In Farm',
-                                  '632 - Ranger Station'],
-                        'retail': ['202 - Store(S) And Living Quarters', '206 - Neighbourhood Store',
-                                   '209 - Shopping Centre (Neighbourhood)',
-                                   '211 - Shopping Centre (Community)', '212 - Department Store - Stand Alone',
-                                   '213 - Shopping Centre (Regional)', '214 - Retail Strip', '215 - Food Market',
-                                   '216 - Commercial Strata-Lot',
-                                   '225 - Convenience Store/Service Station'],
-                        'entertainment': ['236 - Campground (Commercial)', '250 - Theatre Buildings',
-                                          '254 - Neighbourhood Pub', '256 - Restaurant Only',
-                                          '257 - Fast Food Restaurants',
-                                          '266 - Bowling Alley', '270 - Hall (Community, Lodge, Club, Etc.)',
-                                          '280 - Marine Facilities (Marina)',
-                                          '600 - Recreational & Cultural Buildings (Includes Curling',
-                                          '610 - Parks & Playing Fields', '612 - Golf Courses (Includes Public & Private)',
-                                          '614 - Campgrounds',
-                                          '614 - Campgrounds (Includes Government Campgrounds, Ymca &',
-                                          '654 - Recreational Clubs, Ski Hills',
-                                          '660 - Land Classified Recreational Used For'],
-                        'civic': ['210 - Bank', '540 - Community Antenna Television'
-                                  '620 - Government Buildings (Includes Courthouse, Post Office',
-                                  '625 - Garbage Dumps, Sanitary Fills, Sewer Lagoons, Etc.', '630 - Works Yards',
-                                  '634 - Government Research Centres (Includes Nurseries &',
-                                  '640 - Hospitals (Nursing Homes Refer To Commercial Section).',
-                                  '642 - Cemeteries (Includes Public Or Private).',
-                                  '650 - Schools & Universities, College Or Technical Schools',
-                                  '652 - Churches & Bible Schools'],
-                        'agriculture': ['110 - Grain & Forage', '111 - Grain & Forage',
-                                        '120 - Vegetable & Truck', '130 - Tree Fruits',
-                                        '140 - Small Fruits', '150 - Beef', '160 - Dairy', '170 - Poultry', '180 - Mixed',
-                                        '409 - Winery'],
-                        'office': ['203 - Stores And/Or Offices With Apartments', '204 - Store(S) And Offices',
-                                   '208 - Office Building (Primary Use)',
-                                   '620 - Government Buildings (Includes Courthouse, Post Office'],
-                        'industrial': ['031 - Strata-Lot Self Storage-Res Use',
-                                       '217 - Air Space Title',
-                                       '218 - Strata-Lot Self Storage-Business Use',
-                                       '272 - Storage & Warehousing (Open)',
-                                       '273 - Storage & Warehousing (Closed)', '274 - Storage & Warehousing (Cold)',
-                                       '275 - Self Storage', '276 - Lumber Yard Or Building Supplies',
-                                       '300 - Stratified Operational Facility Areas',
-                                       '400 - Fruit & Vegetable',
-                                       '401 - Industrial (Vacant)', '402 - Meat & Poultry', '403 - Sea Food',
-                                       '404 - Dairy Products', '405 - Bakery & Biscuit Manufacturing',
-                                       '406 - Confectionery Manufacturing & Sugar Processing', '408 - Brewery',
-                                       '414 - Miscellaneous (Food Processing)',
-                                       '415 - Sawmills',
-                                       '416 - Planer Mills (When Separate From Sawmill)',
-                                       '418 - Shingle Mills',
-                                       '419 - Sash & Door',
-                                       '420 - Lumber Remanufacturing (When Separate From Sawmill)',
-                                       '423 - IC&I Water Lot (Improved)',
-                                       '424 - Pulp & Paper Mills (Incl Fine Paper, Tissue & Asphalt Roof)',
-                                       '425 - Paper Box, Paper Bag, And Other Paper Remanufacturing.',
-                                       '426 - Logging Operations, Incl Log Storage',
-                                       '428 - Improved',
-                                       '429 - Miscellaneous (Forest And Allied Industry)',
-                                       '434 - Petroleum Bulk Plants',
-                                       '445 - Sand & Gravel (Vacant and Improved)',
-                                       '447 - Asphalt Plants',
-                                       '448 - Concrete Mixing Plants',
-                                       '449 - Miscellaneous (Mining And Allied Industries)', '452 - Leather Industry',
-                                       '454 - Textiles & Knitting Mills', '456 - Clothing Industry',
-                                       '458 - Furniture & Fixtures Industry', '460 - Printing & Publishing Industry',
-                                       '462 - Primary Metal Industries (Iron & Steel Mills,', '464 - Metal Fabricating Industries',
-                                       '466 - Machinery Manufacturing (Excluding Electrical)',
-                                       '470 - Electrical & Electronics Products Industry',
-                                       '472 - Chemical & Chemical Products Industries', '474 - Miscellaneous & (Industrial Other)',
-                                       '476 - Grain Elevators', '478 - Docks & Wharves', '480 - Shipyards','500 - Railway',
-                                       '505 - Marine & Navigational Facilities (Includes Ferry',
-                                       '510 - Bus Company, Including Street Railway', '520 - Telephone',
-                                       '530 - Telecommunications (Other Than Telephone)',
-                                       '515 - Airports, Heliports, Etc.',
-                                       '540 - Community Antenna Television (Cablevision)',
-                                       '550 - Gas Distribution Systems',
-                                       '560 - Water Distribution Systems',
-                                       '580 - Electrical Power Systems (Including Non-Utility']
+                    uses = {'residential': ['000 - Single Family Dwelling',
+                                            '030 - Strata-Lot Residence (Condominium)',
+                                            '032 - Residential Dwelling with Suite',
+                                            '033 - Duplex, Non-Strata Side by Side or Front / Back',
+                                            '034 - Duplex, Non-Strata Up / Down',
+                                            '035 - Duplex, Strata Side by Side',
+                                            '036 - Duplex, Strata Front / Back',
+                                            '037 - Manufactured Home (Within Manufactured Home Park)',
+                                            '038 - Manufactured Home (Not In Manufactured Home Park)',
+                                            '039 - Row Housing (Single Unit Ownership)',
+                                            '040 - Seasonal Dwelling',
+                                            '041 - Duplex, Strata Up / Down',
+                                            '047 - Triplex',
+                                            '049 - Fourplex',
+                                            '050 - Multi-Family (Apartment Block)',
+                                            '052 - Multi-Family (Garden Apartment & Row Housing)',
+                                            '053 - Multi-Family (Conversion)',
+                                            '054 - Multi-Family (High-Rise)', '055 - Multi-Family (Minimal Commercial)',
+                                            '056 - Multi-Family (Residential Hotel)',
+                                            '057 - Stratified Rental Townhouse',
+                                            '058 - Stratified Rental Apartment (Frame Construction)',
+                                            '059 - Stratified Rental Apartment (Hi-Rise Construction)',
+                                            '060 - 2 Acres Or More (Single Family Dwelling, Duplex)',
+                                            '062 - 2 Acres Or More (Seasonal Dwelling)',
+                                            '063 - 2 Acres Or More (Manufactured Home)',
+                                            '234 - Manufactured Home Park',
+                                            '284 - Seniors Strata - Care',
+                                            '285 - Seniors Licensed Care',
+                                            '286 - Seniors Independent & Assisted Living'],
+                            'hospitality': ['042 - Strata-Lot Seasonal Dwelling (Condominium)',
+                                            '230 - Hotel',
+                                            '232 - Motel & Auto Court',
+                                            '233 - Individual Strata Lot (Hotel/Motel)',
+                                            '237 - Bed & Breakfast Operation 4 Or More Units',
+                                            '239 - Bed & Breakfast Operation Less Than 4 Units',
+                                            '238 - Seasonal Resort'],
+                            'retail': ['202 - Store(S) And Living Quarters',
+                                       '206 - Neighbourhood Store',
+                                       '209 - Shopping Centre (Neighbourhood)',
+                                       '211 - Shopping Centre (Community)',
+                                       '212 - Department Store - Stand Alone',
+                                       '213 - Shopping Centre (Regional)',
+                                       '214 - Retail Strip',
+                                       '215 - Food Market',
+                                       '216 - Commercial Strata-Lot',
+                                       '225 - Convenience Store/Service Station'],
+                            'entertainment': ['236 - Campground (Commercial)',
+                                              '250 - Theatre Buildings',
+                                              '254 - Neighbourhood Pub',
+                                              '256 - Restaurant Only',
+                                              '257 - Fast Food Restaurants',
+                                              '266 - Bowling Alley',
+                                              '270 - Hall (Community, Lodge, Club, Etc.)',
+                                              '280 - Marine Facilities (Marina)',
+                                              '600 - Recreational & Cultural Buildings (Includes Curling',
+                                              '610 - Parks & Playing Fields',
+                                              '612 - Golf Courses (Includes Public & Private)',
+                                              '614 - Campgrounds',
+                                              '654 - Recreational Clubs, Ski Hills',
+                                              '660 - Land Classified Recreational Used For'],
+                            'civic': ['210 - Bank',
+                                      '620 - Government Buildings (Includes Courthouse, Post Office',
+                                      '625 - Garbage Dumps, Sanitary Fills, Sewer Lagoons, Etc.',
+                                      '630 - Works Yards',
+                                      '634 - Government Research Centres (Includes Nurseries &',
+                                      '640 - Hospitals (Nursing Homes Refer To Commercial Section).',
+                                      '642 - Cemeteries (Includes Public Or Private).',
+                                      '650 - Schools & Universities, College Or Technical Schools',
+                                      '652 - Churches & Bible Schools'],
+                            'office': ['203 - Stores And/Or Offices With Apartments',
+                                       '204 - Store(S) And Offices',
+                                       '208 - Office Building (Primary Use)']
+                    }
+
+                    """
+                            'vacant': ['001 - Vacant Residential Less Than 2 Acres', '051 - Multi-Family (Vacant)',
+                                       '061 - 2 Acres Or More (Vacant)',
+                                       '111 - Grain & Forage (Vacant)',
+                                       '121 - Vegetable & Truck (Vacant)',
+                                       '201 - Vacant IC&I',
+                                       '421 - Vacant', '422 - IC&I Water Lot (Vacant)',
+                                       '601 - Civic, Institutional & Recreational (Vacant)'],
+                            'parking': ['020 - Residential Outbuilding Only', '029 - Strata Lot (Parking Residential)',
+                                        '043 - Parking (Lot Only, Paved Or Gravel-Res)',
+                                        '219 - Strata Lot (Parking Commercial)',
+                                        '260 - Parking (Lot Only, Paved Or Gravel-Com)', '262 - Parking Garage',
+                                        '490 - Parking Lot Only (Paved Or Gravel)'],
+                            'other': ['002 - Property Subject To Section 19(8)', '070 - 2 Acres Or More (Outbuilding)',
+                                      '190 - Other',
+                                      '200 - Store(S) And Service Commercial', '205 - Big Box',
+                                      '220 - Automobile Dealership', '222 - Service Station',
+                                      '224 - Self-Serve Service Station',
+                                      '226 - Car Wash', '227 - Automobile Sales (Lot)',
+                                      '228 - Automobile Paint Shop, Garages, Etc.',
+                                      '258 - Drive-In Restaurant', '288 - Sign Or Billboard Only',
+                                      '590 - Miscellaneous (Transportation & Communication)',
+                                      '615 - Government Reserves',
+                                      '632 - Ranger Station'],
+                            'agriculture': ['110 - Grain & Forage', '111 - Grain & Forage',
+                                            '120 - Vegetable & Truck', '130 - Tree Fruits',
+                                            '140 - Small Fruits', '150 - Beef', '160 - Dairy', '170 - Poultry',
+                                            '180 - Mixed',
+                                            '240 - Greenhouses And Nurseries (Not Farm Class)'],
+                            'industrial': ['031 - Strata-Lot Self Storage-Res Use',
+                                           '217 - Air Space Title',
+                                           '218 - Strata-Lot Self Storage-Business Use',
+                                           '272 - Storage & Warehousing (Open)',
+                                           '273 - Storage & Warehousing (Closed)', '274 - Storage & Warehousing (Cold)',
+                                           '275 - Self Storage', '276 - Lumber Yard Or Building Supplies',
+                                           '300 - Stratified Operational Facility Areas',
+                                           '400 - Fruit & Vegetable',
+                                           '401 - Industrial (Vacant)', '402 - Meat & Poultry', '403 - Sea Food',
+                                           '404 - Dairy Products', '405 - Bakery & Biscuit Manufacturing',
+                                           '406 - Confectionery Manufacturing & Sugar Processing', '408 - Brewery',
+                                           '409 - Winery',
+                                           '414 - Miscellaneous (Food Processing)',
+                                           '415 - Sawmills',
+                                           '416 - Planer Mills (When Separate From Sawmill)',
+                                           '418 - Shingle Mills',
+                                           '419 - Sash & Door',
+                                           '420 - Lumber Remanufacturing (When Separate From Sawmill)',
+                                           '423 - IC&I Water Lot (Improved)',
+                                           '424 - Pulp & Paper Mills (Incl Fine Paper, Tissue & Asphalt Roof)',
+                                           '425 - Paper Box, Paper Bag, And Other Paper Remanufacturing.',
+                                           '426 - Logging Operations, Incl Log Storage',
+                                           '428 - Improved',
+                                           '429 - Miscellaneous (Forest And Allied Industry)',
+                                           '434 - Petroleum Bulk Plants',
+                                           '445 - Sand & Gravel (Vacant and Improved)',
+                                           '447 - Asphalt Plants',
+                                           '448 - Concrete Mixing Plants',
+                                           '449 - Miscellaneous (Mining And Allied Industries)',
+                                           '452 - Leather Industry',
+                                           '454 - Textiles & Knitting Mills', '456 - Clothing Industry',
+                                           '458 - Furniture & Fixtures Industry',
+                                           '460 - Printing & Publishing Industry',
+                                           '462 - Primary Metal Industries (Iron & Steel Mills,',
+                                           '464 - Metal Fabricating Industries',
+                                           '466 - Machinery Manufacturing (Excluding Electrical)',
+                                           '470 - Electrical & Electronics Products Industry',
+                                           '472 - Chemical & Chemical Products Industries',
+                                           '474 - Miscellaneous & (Industrial Other)',
+                                           '476 - Grain Elevators',
+                                           '478 - Docks & Wharves',
+                                           '480 - Shipyards',
+                                           '500 - Railway',
+                                           '505 - Marine & Navigational Facilities (Includes Ferry',
+                                           '510 - Bus Company, Including Street Railway', '520 - Telephone',
+                                           '530 - Telecommunications (Other Than Telephone)',
+                                           '515 - Airports, Heliports, Etc.',
+                                           '540 - Community Antenna Television (Cablevision)',
+                                           '550 - Gas Distribution Systems',
+                                           '560 - Water Distribution Systems',
+                                           '580 - Electrical Power Systems (Including Non-Utility']
                     }
 
                     # Broaden 'other' uses for a better accuracy on diversity indexes
                     uses['other'] = uses['other'] + uses['vacant'] + uses['parking'] + uses['agriculture'] + uses['industrial']
                     uses['vacant'], uses['parking'], uses['agriculture'], uses['industrial'] = [], [], [], []
+"""
 
                     new_uses = []
                     index = list(out_gdf.columns).index("PRIMARY_ACTUAL_USE")
@@ -1337,7 +1554,7 @@ class BritishColumbia:
                             if row[1]['PRIMARY_ACTUAL_USE'] in value:
                                 new_uses.append(key)
                         if row[1]['PRIMARY_ACTUAL_USE'] not in all_prim_uses:
-                            new_uses.append(row[1]['PRIMARY_ACTUAL_USE'])
+                            new_uses.append('other')
                     out_gdf['n_use'] = new_uses
 
                     # Export assessment fabric layer to GeoPackage
@@ -1364,7 +1581,8 @@ class BritishColumbia:
 
                     # Export geojson and read again to try to export to GeoPackage
                     p_gdf.to_file(city.gpkg, driver='GPKG', layer='land_assessment_parcels')
-                    return print("> Data aggregation from BC Assessment finished in {elapsed} minutes")
+                    elapsed = round((timeit.default_timer() - start_time) / 60, 1)
+                    return print(f"> Data aggregation from BC Assessment finished in {elapsed} minutes")
 
     # BC Transit
     def get_bc_transit(self, urls, run=True, down=True):
@@ -1375,10 +1593,9 @@ class BritishColumbia:
                     dir = f'{city.directory}Databases/BCTransit'
                     if down:
                         print(f"Downloading transit data from BC Transit for {city.municipality}")
-                        extension = filename.split('.')[len(filename.split('.'))-1]
-                        zip_path = f'{dir}/{city.municipality}.{extension}'
+                        zip_path = f"{dir}/{city.municipality}.{url.split('/')[len(url.split('/'))-1]}"
                         filename = download_file(url, file_path=zip_path)
-                        os.rename(f'{dir}/{filename}', zip_path)
+                        os.rename(filename, zip_path)
 
                     # Create directory if it doesn't exist
                     n_dir = f"{dir}/{city.municipality}"
@@ -1402,19 +1619,21 @@ class BritishColumbia:
                         s_df = times.loc[times['stop_id'] == stop]
                         n_trips = len(s_df['trip_id'].unique())
                         frequency = n_trips/len(calen)
-                        stops.at[stop, 'n_trips'] = n_trips
-                        stops.at[stop,'frequency'] = frequency
+                        stops.loc[stops['stop_id'] == stop, 'n_trips'] = int(n_trips)
+                        stops.loc[stops['stop_id'] == stop, 'frequency'] = frequency
                         print(f"> Stop {stop} processed with {n_trips} trips at a frequency of {frequency} trips per day")
 
                     # Create stop geometries
                     stops['geometry'] = [Point(lon, lat) for lon, lat in zip(stops.stop_lon, stops.stop_lat)]
                     stops_gdf = gpd.GeoDataFrame(stops, geometry='geometry')
+                    stops_gdf = stops_gdf.dropna(subset=['frequency', 'geometry'], axis=0)[stops_gdf.geometry.is_valid]
+                    stops_gdf = stops_gdf.reset_index(drop=True)
 
                     # Reproject and export
                     stops_gdf.crs = 4326
                     stops_gdf = stops_gdf.to_crs(city.crs)
-                    stops_gdf.to_file(city.gpkg, layer='transit_stops')
-
+                    stops_gdf.to_file(city.gpkg, layer='network_transit')
+                    print(f"Transit stops for {city.municipality} saved at 'network_transit' layer")
         return
 
 
