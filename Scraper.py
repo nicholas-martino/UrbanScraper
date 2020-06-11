@@ -23,19 +23,19 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
 
-import zipfile
-import timeit
 import datetime
-import numpy as np
+import gc
 import glob
 import io
 import json
 import logging
 import os
 import time
+import timeit
+import zipfile
 from io import StringIO
-from urllib import request, error, parse
-from elementslab.Analyst import GeoBoundary
+from urllib import request, parse
+
 import geopandas as gpd
 import osmnx as ox
 import pandas as pd
@@ -43,10 +43,11 @@ import regex
 import requests
 import selenium.webdriver as webdriver
 from Learning.Scraping import Scraper
-from Statistics.basic_stats import normalize
-from Visualization import polar_chart as pc
+# from Statistics.basic_stats import normalize
+# from Visualization import polar_chart as pc
 from bs4 import BeautifulSoup
 from craigslist import CraigslistHousing
+from elementslab.Analyst import GeoBoundary
 from geopy.geocoders import Nominatim
 from nltk import word_tokenize
 from nltk.corpus import stopwords
@@ -58,6 +59,7 @@ from pdfminer.pdfpage import PDFPage
 from selenium.webdriver.firefox.options import Options
 from shapely import wkt
 from shapely.geometry import *
+from skbio import diversity
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.preprocessing import LabelEncoder
@@ -90,244 +92,257 @@ class GeoScraper:
     def employment_craigslist(self):
         return self
 
-    def employment_indeed(self, n_pages=3):
-        print(f"Downloading employment posts from Indeed")
+    def employment_indeed(self, run=True, n_pages=3):
+        if run:
+            print(f"> Downloading employment posts from Indeed")
 
-        # Build search
-        name = self.city.municipality.replace(',', '%2C').replace(' ', '+')
-        start = 0
+            # Build search
+            name = self.city.municipality.replace(',', '%2C').replace(' ', '+')
+            start = 0
 
-        # Create selenium driver
-        s = Scraper()
-        s.driver.minimize_window()
+            # Create selenium driver
+            s = Scraper()
+            s.driver.minimize_window()
 
-        data = {'job': [], 'time': [], 'salary': [], 'company': [], 'geometry': []}
-        for i in range(start, n_pages):
-            url = f"https://www.indeed.ca/jobs?q=&l={name}&start={i*20}"
+            data = {'job': [], 'time': [], 'salary': [], 'company': [], 'geometry': []}
+            for i in range(start, n_pages):
+                url = f"https://www.indeed.ca/jobs?q=&l={name}&start={i*20}"
 
-            # Access and parse the page
-            page = requests.get(url)
-            soup = BeautifulSoup(page.text, "html.parser")
+                # Access and parse the page
+                page = requests.get(url)
+                soup = BeautifulSoup(page.text, "html.parser")
 
-            # Extract job titles
-            for div in soup.find_all(name="div", attrs={"class": "row"}):
-                for a in div.find_all(name="a", attrs={"data-tn-element": "jobTitle"}):
-                    data['job'].append(a["title"])
+                # Extract job titles
+                for div in soup.find_all(name="div", attrs={"class": "row"}):
+                    for a in div.find_all(name="a", attrs={"data-tn-element": "jobTitle"}):
+                        data['job'].append(a["title"])
 
-                    # Extract time stamps
-                    page1 = requests.get(f"https://www.indeed.ca/{a['href']}")
-                    soup1 = BeautifulSoup(page1.text, "html.parser")
-                    footer = soup1.find_all(name="div", attrs={"class": "jobsearch-JobMetadataFooter"})
-                    if len(footer) == 0: data['time'].append('Unknown')
+                        # Extract time stamps
+                        page1 = requests.get(f"https://www.indeed.ca/{a['href']}")
+                        soup1 = BeautifulSoup(page1.text, "html.parser")
+                        footer = soup1.find_all(name="div", attrs={"class": "jobsearch-JobMetadataFooter"})
+                        if len(footer) == 0: data['time'].append('Unknown')
+                        else:
+                            for div1 in footer:
+                                p_days = div1.find_all(text=True)[1]
+                                for j in p_days.split():
+                                    try:
+                                        result = float(j)
+                                        break
+                                    except: result = 0
+                                data['time'].append(f"{datetime.datetime.now().date()-datetime.timedelta(days=result)} - {datetime.datetime.now()}")
+
+                # Extract salaries
+                for div in soup.find_all(name="div", attrs={"class": "row"}):
+                    if len(div.find_all(name="span", attrs={"class": "salaryText"})) == 0: data['salary'].append('Unknown')
                     else:
-                        for div1 in footer:
-                            p_days = div1.find_all(text=True)[1]
-                            for j in p_days.split():
-                                try:
-                                    result = float(j)
-                                    break
-                                except: result = 0
-                            data['time'].append(f"{datetime.datetime.now().date()-datetime.timedelta(days=result)} - {datetime.datetime.now()}")
+                        for sal in div.find_all(name="span", attrs={"class": "salaryText"}):
+                            try: data['salary'].append(sal.text)
+                            except:
+                                try: data['salary'].append(sal[0].text)
+                                except: data['salary'].append('Unknown')
 
-            # Extract salaries
-            for div in soup.find_all(name="div", attrs={"class": "row"}):
-                if len(div.find_all(name="span", attrs={"class": "salaryText"})) == 0: data['salary'].append('Unknown')
-                else:
-                    for sal in div.find_all(name="span", attrs={"class": "salaryText"}):
-                        try: data['salary'].append(sal.text)
-                        except:
-                            try: data['salary'].append(sal[0].text)
-                            except: data['salary'].append('Unknown')
+                # Extract companies
+                for div in soup.find_all(name="div", attrs={"class": "row"}):
+                    company = div.find_all(name="span", attrs={"class": "company"})
+                    if len(company) > 0:
+                        for b in company:
+                            data['company'].append(b.text.strip())
+                    else:
+                        sec_try = div.find_all(name="span", attrs={"class": "result - link - source"})
+                        for span in sec_try:
+                            data['company'].append(span.text.strip())
 
-            # Extract companies
-            for div in soup.find_all(name="div", attrs={"class": "row"}):
-                company = div.find_all(name="span", attrs={"class": "company"})
-                if len(company) > 0:
-                    for b in company:
-                        data['company'].append(b.text.strip())
-                else:
-                    sec_try = div.find_all(name="span", attrs={"class": "result - link - source"})
-                    for span in sec_try:
-                        data['company'].append(span.text.strip())
+                # Clean street names from OSM
+                c_links = gpd.read_file(self.city.gpkg, layer='network_links')
+                cl_strs = [i.replace("Avenue", "").replace("Street", "").replace("Road", "").replace("Drive", "").strip(" ")
+                           for i in list(c_links) if i is not None]
 
-            # Clean street names from OSM
-            c_links = gpd.read_file(self.city.gpkg, layer='network_links')
-            cl_strs = [i.replace("Avenue", "").replace("Street", "").replace("Road", "").replace("Drive", "").strip(" ")
-                       for i in list(c_links) if i is not None]
+                # Match locations from job names
+                rec_locs = []
+                for job in data['job']:
+                    locs = []
+                    for word in word_tokenize(job):
+                        if word in cl_strs: locs.append(word)
+                    rec_locs.append(locs)
+                rec_locs = ['+'.join(l) for l in rec_locs]
 
-            # Match locations from job names
-            rec_locs = []
-            for job in data['job']:
-                locs = []
-                for word in word_tokenize(job):
-                    if word in cl_strs: locs.append(word)
-                rec_locs.append(locs)
-            rec_locs = ['+'.join(l) for l in rec_locs]
+                # Extract general location
+                locations = []
+                divs = soup.findAll("div", attrs={"class": "recJobLoc"})
+                for div in divs:
+                    locations.append(div['data-rc-loc'])
 
-            # Extract general location
-            locations = []
-            divs = soup.findAll("div", attrs={"class": "recJobLoc"})
-            for div in divs:
-                locations.append(div['data-rc-loc'])
+                # Get urls to search Google Maps
+                urls = [f"https://www.google.com/maps/place/{c.replace(' ', '+')}+{l.replace(' ', '+')}+{rl}"
+                        for c, l, rl in zip(data['company'], locations, rec_locs)]
 
-            # Get urls to search Google Maps
-            urls = [f"https://www.google.com/maps/place/{c.replace(' ', '+')}+{l.replace(' ', '+')}+{rl}"
-                    for c, l, rl in zip(data['company'], locations, rec_locs)]
+                # Extract point location from Google Map based on company names
+                for url in urls:
 
-            # Extract point location from Google Map based on company names
-            for url in urls:
+                    # Load URL
+                    while True:
+                        try:
+                            s.driver.get(url)
+                            time.sleep(2)
+                            break
+                        except: pass
 
-                # Load URL
-                s.driver.get(url)
-                time.sleep(2)
+                    # Press search button
+                    try: s.driver.find_elements_by_id("searchbox-searchbutton")[0].click()
+                    except: s.driver.find_elements_by_id("searchbox-searchbutton").click()
+                    time.sleep(2)
 
-                # Press search button
-                try: s.driver.find_elements_by_id("searchbox-searchbutton")[0].click()
-                except: s.driver.find_elements_by_id("searchbox-searchbutton").click()
-                time.sleep(2)
+                    # Get address of first item
+                    try: address = s.driver.find_elements_by_class_name("section-result-location")[0].text
+                    except:
+                        try: address = s.driver.find_elements_by_class_name("section-info-text")[0].text
+                        except: address = None
 
-                # Get address of first item
-                try: address = s.driver.find_elements_by_class_name("section-result-location")[0].text
-                except:
-                    try: address = s.driver.find_elements_by_class_name("section-info-text")[0].text
-                    except: address = None
+                    # Get point location from address
+                    locator = Nominatim(user_agent="myGeocoder")
+                    try: geom = Point(locator.geocode(f"{address}, {self.city.municipality}")[1])
+                    except:
+                        try: geom = Point(locator.geocode(f"{address}, {self.city.city_name}")[1])
+                        except: geom = 'Unknown'
+                    data['geometry'].append(geom)
 
-                # Get point location from address
-                locator = Nominatim(user_agent="myGeocoder")
-                try: geom = Point(locator.geocode(f"{address}, {self.city.municipality}")[1])
-                except:
-                    try: geom = Point(locator.geocode(f"{address}, {self.city.city_name}")[1])
-                    except: geom = 'Unknown'
-                data['geometry'].append(geom)
+            # Close web browser
+            s.driver.close()
 
-        # Close web browser
-        s.driver.close()
-
-        # Export to GeoPackage
-        try: gdf = gpd.GeoDataFrame().from_dict(data)
-        except: pass
-        gdf = gdf.loc[gdf['geometry'] != 'Unknown']
-        gdf['geometry'] = [Point(t.y, t.x) for t in gdf.geometry]
-        gdf = gdf.set_geometry('geometry')
-        gdf.crs = 4326
-        gdf.to_crs(epsg=self.city.crs, inplace=True)
-        self.city.boundary.to_crs(epsg=self.city.crs, inplace=True)
-        try:
-            gdf0 = gpd.read_file(self.city.gpkg, layer='indeed_employment')
-            gdf = pd.concat([gdf0, gdf])
-        except: pass
-        gdf.drop_duplicates(inplace=True)
-        gdf = gpd.overlay(gdf, self.city.boundary)
-
-        try: gdf.to_file(self.city.gpkg, layer='indeed_employment')
-        except: pass
-        print(f"> Employment data downloaded from Indeed")
+            # Export to GeoPackage
+            try: gdf = gpd.GeoDataFrame().from_dict(data)
+            except: pass
+            gdf = gdf.loc[gdf['geometry'] != 'Unknown']
+            gdf['geometry'] = [Point(t.y, t.x) for t in gdf.geometry]
+            gdf = gdf.set_geometry('geometry')
+            gdf.crs = 4326
+            gdf.to_crs(epsg=self.city.crs, inplace=True)
+            self.city.boundary.to_crs(epsg=self.city.crs, inplace=True)
+            gdf['date'] = str(datetime.datetime.now().date())
+            try:
+                gdf0 = gpd.read_file(f"{self.city.directory}Databases/Indeed/{self.city.municipality}.geojson", driver='GeoJSON', encoding="ISO-8859-1").copy()
+                gdf = pd.concat([gdf0, gdf])
+            except: pass
+            gdf = gdf.loc[:, ['job', 'time', 'salary', 'company', 'date', 'geometry']]
+            gdf = gdf.drop_duplicates(subset=['job'])
+            gdf = gdf.reset_index()
+            if len(gdf) > 0:
+                gdf.to_file(f"{self.city.directory}Databases/Indeed/{self.city.municipality}.geojson", driver='GeoJSON')
+                try:
+                    gdf.to_file(self.city.gpkg, layer='indeed_employment')
+                    print(f"> Employment data downloaded from Indeed and saved on {self.city.municipality} database with {len(gdf)} data points")
+                except: print(f"!!! Employment data not downloaded from Indeed !!!")
         return self
 
-    def housing_craigslist(self, site, n_results):
+    def housing_craigslist(self, site, n_results, run=True):
         print(f"Downloading {self.city.city_name}'s housing posts from Craigslist")
-        cl = CraigslistHousing(site=site)
-        results = cl.get_results(sort_by='newest', geotagged=True, limit=n_results)
 
-        # List results
-        uid = []
-        name = []
-        area = []
-        price = []
-        brooms = []
-        coords = []
-        dates = []
-        for result in results:
-            uid.append(result['id'])
-            name.append(result['name'])
-            area.append(result['area'])
-            brooms.append(result['bedrooms'])
-            coords.append(result['geotag'])
-            price.append(float(result[('price')][1:]))
-            dates.append(result['datetime'])
-            # print (result)
-
-        # Format coordinates
-        coord_x = []
-        coord_y = []
-        for coord in coords:
-            split = str(coord).split(',')
+        if run:
             try:
-                coord_x.append(str(split[1])[1:][:-1])
-                coord_y.append(str(split[0])[1:][:-1])
-            except:
-                coord_x.append(str(0.00))
-                coord_y.append(str(0.00))
-        a = []
-        for i in coord_x: a.append(f'POINT ({str(i)}')
-        b = []
-        for i in coord_y: b.append(' ' + str(i) + ')')
+                cl = CraigslistHousing(site=site)
+                results = cl.get_results(sort_by='newest', geotagged=True, limit=n_results)
 
-        # Remove null items
-        ccoord = ([str(x + y) for x, y in zip(a, b)])
-        df = pd.DataFrame(
-            {'id': uid, 'name': name, 'price': price, 'area': area, 'bedrooms': brooms, 'geometry': ccoord,
-             'date': dates})
-        coord_nnull = df['geometry'] != "POINT (0.0 0.0)"
-        area_nnull = df['area'].notnull()
-        df = df[(area_nnull) & (coord_nnull)]
+                # List results
+                uid = []
+                name = []
+                area = []
+                price = []
+                brooms = []
+                coords = []
+                dates = []
+                for result in results:
+                    uid.append(result['id'])
+                    name.append(result['name'])
+                    area.append(result['area'])
+                    brooms.append(result['bedrooms'])
+                    coords.append(result['geotag'])
+                    price.append(float(result[('price')][1:]))
+                    dates.append(result['datetime'])
+                    # print (result)
 
-        # Geoprocess Coordinates
-        df['geometry'] = df['geometry'].apply(wkt.loads)
-        cl_gdf = gpd.GeoDataFrame(df, geometry='geometry')
-        cl_gdf.crs = 4326
+                # Format coordinates
+                coord_x = []
+                coord_y = []
+                for coord in coords:
+                    split = str(coord).split(',')
+                    try:
+                        coord_x.append(str(split[1])[1:][:-1])
+                        coord_y.append(str(split[0])[1:][:-1])
+                    except:
+                        coord_x.append(str(0.00))
+                        coord_y.append(str(0.00))
+                a = []
+                for i in coord_x: a.append(f'POINT ({str(i)}')
+                b = []
+                for i in coord_y: b.append(' ' + str(i) + ')')
 
-        # Calculate Price/Area
-        cl_gdf['area'] = cl_gdf['area'].str[:-3].astype(float)
-        cl_gdf['price_sqft'] = cl_gdf['price'] / cl_gdf['area']
+                # Remove null items
+                ccoord = ([str(x + y) for x, y in zip(a, b)])
+                df = pd.DataFrame(
+                    {'id': uid, 'name': name, 'price': price, 'area': area, 'bedrooms': brooms, 'geometry': ccoord,
+                     'date': dates})
+                coord_nnull = df['geometry'] != "POINT (0.0 0.0)"
+                area_nnull = df['area'].notnull()
+                df = df[(area_nnull) & (coord_nnull)]
 
-        # Get Vancouver Boundary
-        van_gdf = ox.gdf_from_place(self.city.municipality)
-        van_gdf.crs = 4326
-        van_gdf.to_crs(epsg=self.city.crs)
-        van_pol = van_gdf.geometry[0]
-        if van_pol is None: print('Administrative boundary download failed :(')
+                # Geoprocess Coordinates
+                df['geometry'] = df['geometry'].apply(wkt.loads)
+                cl_gdf = gpd.GeoDataFrame(df, geometry='geometry')
+                cl_gdf.crs = 4326
 
-        # Filter data
-        pd.set_option('display.min_rows', 10)
-        cl_gdf.to_crs(epsg=self.city.crs)
-        cl_gdf = cl_gdf[cl_gdf.within(van_pol)]
-        csv_path = '__pycache__/' + self.city.municipality + '_Craigslist.csv'
-        cl_gdf = cl_gdf[cl_gdf['area'] > 270]
+                # Calculate Price/Area
+                cl_gdf['area'] = cl_gdf['area'].str[:-3].astype(float)
+                cl_gdf['price_sqft'] = cl_gdf['price'] / cl_gdf['area']
 
-        # Write data in csv
-        with io.open(csv_path, "a", encoding="utf-8") as f:
-            cl_gdf.to_csv(f, header=False, index=False)
-        try:
-            df = pd.read_csv(csv_path)
-            df = df.drop_duplicates()
-            df.to_csv(csv_path, header=False, index=False)
+                # Get Vancouver Boundary
+                van_gdf = ox.gdf_from_place(self.city.municipality)
+                van_gdf.crs = 4326
+                van_gdf.to_crs(epsg=self.city.crs)
+                van_pol = van_gdf.geometry[0]
+                if van_pol is None: print('Administrative boundary download failed :(')
 
-            # Write data in GeoPackage
-            df = pd.read_csv(csv_path, encoding="utf8")
-            df.columns = ['index', 'description', 'price', 'area', 'bedrooms', 'geometry', 'date', 'price_sqft']
-            numerics = ['price', 'area', 'bedrooms', 'price_sqft']
-            for i in numerics: pd.to_numeric(df[i], errors='coerce').fillna(0).astype(float)
-            gdf = gpd.GeoDataFrame(df)
-            gdf['geometry'] = gdf['geometry'].apply(wkt.loads)
-            gdf.set_geometry('geometry')
-            gdf.crs = 4326
-            try:
-                cl_cur = gpd.read_file(self.city.gpkg, layer='craigslist_housing', driver='GPKG')
-                try: cl_cur.drop('fid', inplace=True)
-                except: pass
-                gdf = pd.concat([cl_cur, gdf])
-                gdf.drop_duplicates(inplace=True)
-                print(f"Craigslist data for {self.city.city_name} downloaded and joined")
-            except: pass
-            gdf.to_file('Databases/' + self.city.municipality + '.gpkg', layer='craigslist_housing', driver="GPKG")
-            print(f"Craigslist data for {self.city.city_name} exported to GeoPackage")
+                # Filter data
+                pd.set_option('display.min_rows', 10)
+                cl_gdf.to_crs(epsg=self.city.crs)
+                cl_gdf = cl_gdf[cl_gdf.within(van_pol)]
+                csv_path = '__pycache__/' + self.city.municipality + '_Craigslist.csv'
+                cl_gdf = cl_gdf[cl_gdf['area'] > 270]
 
-        except:
-            gdf = None
-            print(f"Failed to process craigslist data for {self.city.city_name} :(")
-            pass
-        return gdf
+                # Write data in csv
+                with io.open(csv_path, "a", encoding="utf-8") as f:
+                    cl_gdf.to_csv(f, header=False, index=False)
+                try:
+                    df = pd.read_csv(csv_path)
+                    df = df.drop_duplicates()
+                    df.to_csv(csv_path, header=False, index=False)
+
+                    # Write data in GeoPackage
+                    df = pd.read_csv(csv_path, encoding="utf8")
+                    df.columns = ['index', 'description', 'price', 'area', 'bedrooms', 'geometry', 'date', 'price_sqft']
+                    numerics = ['price', 'area', 'bedrooms', 'price_sqft']
+                    for i in numerics: pd.to_numeric(df[i], errors='coerce').fillna(0).astype(float)
+                    gdf = gpd.GeoDataFrame(df)
+                    gdf['geometry'] = gdf['geometry'].apply(wkt.loads)
+                    gdf.set_geometry('geometry')
+                    gdf.crs = 4326
+                    try:
+                        cl_cur = gpd.read_file(self.city.gpkg, layer='craigslist_housing', driver='GPKG')
+                        try: cl_cur.drop('fid', inplace=True)
+                        except: pass
+                        gdf = pd.concat([cl_cur, gdf])
+                        gdf.drop_duplicates(inplace=True)
+                        print(f"Craigslist data for {self.city.city_name} downloaded and joined")
+                    except: pass
+                    gdf.to_file('Databases/' + self.city.municipality + '.gpkg', layer='craigslist_housing', driver="GPKG")
+                    print(f"Craigslist data for {self.city.city_name} exported to GeoPackage")
+
+                except:
+                    gdf = None
+                    print(f"Failed to process craigslist data for {self.city.city_name} :(")
+                    pass
+                return gdf
+            except: print(f"Failed to process craigslist data for {self.city.city_name} :(")
 
     def housing_zillow(self, url='https://www.zillow.com/homes/british-columbia_rb/'):
 
@@ -381,114 +396,116 @@ class GeoScraper:
         return None
 
     # Scrape health and safety indicators
-    def air_quality(self, token):
+    def air_quality(self, token, run=True):
         """
         A Python wrapper for AQICN API.
         The library can be used to search and retrieve Air Quality Index data.
         Please refer to AQICN website to obtain token that must be used for access.
         """
+        if run:
+            endpoint = 'https://api.waqi.info/'
+            print(f"Downloading air quality data from {endpoint}")
+            endpoint_search = endpoint + 'search/'
+            endpoint_obs = endpoint + 'feed/@%d/'
+            endpoint_geo = endpoint + 'feed/geo:%d;%d/'
 
-        endpoint = 'https://api.waqi.info/'
-        print(f"Downloading air quality data from {endpoint}")
-        endpoint_search = endpoint + 'search/'
-        endpoint_obs = endpoint + 'feed/@%d/'
-        endpoint_geo = endpoint + 'feed/geo:%d;%d/'
+            def find_station_by_city(city_name, token):
+                """Lookup AQI database for station codes in a given city."""
+                req = requests.get(
+                    endpoint_search,
+                    params={
+                        'token': token,
+                        'keyword': city_name
+                    })
 
-        def find_station_by_city(city_name, token):
-            """Lookup AQI database for station codes in a given city."""
-            req = requests.get(
-                endpoint_search,
-                params={
-                    'token': token,
-                    'keyword': city_name
-                })
+                if req.status_code == 200 and req.json()["status"] == "ok":
+                    return [result["uid"] for result in req.json()["data"]]
+                else:
+                    return []
 
-            if req.status_code == 200 and req.json()["status"] == "ok":
-                return [result["uid"] for result in req.json()["data"]]
-            else:
-                return []
+            def get_location_observation(lat, lng, token):
+                """Lookup observations by geo coordinates."""
+                req = requests.get(
+                    endpoint_geo % (lat, lng),
+                    params={
+                        'token': token
+                    })
 
-        def get_location_observation(lat, lng, token):
-            """Lookup observations by geo coordinates."""
-            req = requests.get(
-                endpoint_geo % (lat, lng),
-                params={
-                    'token': token
-                })
-
-            if req.status_code == 200 and req.json()["status"] == "ok":
-                return parse_observation_response(req.json()["data"])
-            return {}
-
-        def parse_observation_response(json):
-            """Decode AQICN observation response JSON into python object."""
-            logging.debug(json)
-
-            try:
-                iaqi = json['iaqi']
-                result = {
-                    'idx': json['idx'],
-                    'city': json.get('city', ''),
-                    'aqi': json['aqi'],
-                    'dominentpol': json.get("dominentpol", ''),
-                    'time': json['time']['s'],
-                    'iaqi': [{'p': item, 'v': iaqi[item]['v']} for item in iaqi]
-                }
-                return result
-            except:
-                print(f'No air quality index data found for station {station}')
-
-        def get_station_observation(station_code, token):
-            """Request station data for a specific station identified by code.
-            A language parameter can also be specified to translate location
-            information (default: "en")
-            """
-            req = requests.get(
-                endpoint_obs % (station_code),
-                params={
-                    'token': token
-                })
-
-            if req.status_code == 200 and req.json()['status'] == "ok":
-                return parse_observation_response(req.json()['data'])
-            else:
+                if req.status_code == 200 and req.json()["status"] == "ok":
+                    return parse_observation_response(req.json()["data"])
                 return {}
 
-        stations = find_station_by_city(self.city.municipality, token)
-        observations = {}
-        for station in stations:
-            observations[station] = get_station_observation(station, token)
+            def parse_observation_response(json):
+                """Decode AQICN observation response JSON into python object."""
+                logging.debug(json)
 
-        # Create function to extract data from dict
-        get_val = lambda col: [observations[key][col] for key in list(observations.keys()) if observations[key] is not None]
+                try:
+                    iaqi = json['iaqi']
+                    result = {
+                        'idx': json['idx'],
+                        'city': json.get('city', ''),
+                        'aqi': json['aqi'],
+                        'dominentpol': json.get("dominentpol", ''),
+                        'time': json['time']['s'],
+                        'iaqi': [{'p': item, 'v': iaqi[item]['v']} for item in iaqi]
+                    }
+                    return result
+                except:
+                    print(f'No air quality index data found for station {station}')
 
-        # Create DataFrame and geo reference it
-        df = pd.DataFrame.from_dict({'lat': [d['geo'][0] for d in get_val('city')], 'long': [d['geo'][1] for d in get_val('city')]})
-        gdf = gpd.GeoDataFrame(geometry=gpd.points_from_xy(df.long, df.lat))
+            def get_station_observation(station_code, token):
+                """Request station data for a specific station identified by code.
+                A language parameter can also be specified to translate location
+                information (default: "en")
+                """
+                req = requests.get(
+                    endpoint_obs % (station_code),
+                    params={
+                        'token': token
+                    })
 
-        # Get data from dict into GeoDataFrame
-        gdf['idx'] = get_val('idx')
-        gdf['aqi'] = get_val('aqi')
-        gdf.replace("-", 0, inplace=True)
-        gdf['aqi'].astype(float)
-        gdf['time'] = get_val('time')
-        gdf['dominentpol'] = get_val('dominentpol')
+                if req.status_code == 200 and req.json()['status'] == "ok":
+                    return parse_observation_response(req.json()['data'])
+                else:
+                    return {}
 
-        # Reproject data
-        gdf.crs = 4326
-        gdf.to_crs(self.city.crs)
+            stations = find_station_by_city(self.city.municipality, token)
+            observations = {}
+            for station in stations:
+                observations[station] = get_station_observation(station, token)
 
-        # Check if GeoDataFrame exists and append new data if it does
-        try:
-            aq_cur = gpd.read_file(self.city.gpkg, layer='air_quality', driver='GPKG')
-            try: aq_cur.drop('fid', inplace=True)
-            except: pass
-            gdf = pd.concat([aq_cur, gdf])
-        except: pass
+            # Create function to extract data from dict
+            get_val = lambda col: [observations[key][col] for key in list(observations.keys()) if observations[key] is not None]
 
-        # Export to GeoPackage
-        gdf.to_file(self.city.gpkg, layer='air_quality', driver='GPKG')
-        return gdf
+            # Create DataFrame and geo reference it
+            try:
+                df = pd.DataFrame.from_dict({'lat': [d['geo'][0] for d in get_val('city')], 'long': [d['geo'][1] for d in get_val('city')]})
+                gdf = gpd.GeoDataFrame(geometry=gpd.points_from_xy(df.long, df.lat))
+
+                # Get data from dict into GeoDataFrame
+                gdf['idx'] = get_val('idx')
+                gdf['aqi'] = get_val('aqi')
+                gdf.replace("-", 0, inplace=True)
+                gdf['aqi'].astype(float)
+                gdf['time'] = get_val('time')
+                gdf['dominentpol'] = get_val('dominentpol')
+
+                # Reproject data
+                gdf.crs = 4326
+                gdf.to_crs(self.city.crs)
+
+                # Check if GeoDataFrame exists and append new data if it does
+                try:
+                    aq_cur = gpd.read_file(self.city.gpkg, layer='air_quality', driver='GPKG')
+                    try: aq_cur.drop('fid', inplace=True)
+                    except: pass
+                    gdf = pd.concat([aq_cur, gdf])
+                except: pass
+
+                # Export to GeoPackage
+                gdf.to_file(self.city.gpkg, layer='air_quality', driver='GPKG')
+                return gdf
+            except: print(f"Air quality data scraping failed for {self.city.municipality}")
 
     def landscape_greenness(self):
         return self
@@ -509,6 +526,7 @@ class GeoScraper:
 
             while area > 0.25:
                 out_bounds = []
+
                 # Break each boundary into four parts
                 for b in boundaries:
                     cutter = MultiLineString([
@@ -517,6 +535,7 @@ class GeoScraper:
                     ]).buffer(0.000001)
                     boundaries = b.difference(cutter)
                     out_bounds = out_bounds + [b for b in boundaries]
+
                 # Check area of the bounding box of each splitted part (out_bounds)
                 bbox_areas = [Polygon([
                     Point(b.bounds[0], b.bounds[1]),
@@ -531,9 +550,10 @@ class GeoScraper:
                     print(f"Area too big, dividing boundary into {len(out_bounds)} polygons")
                     break
 
-            try: gdf = gpd.read_file(self.city.gpkg, layer='gps_traces')
+            try: gdf = gpd.read_file(self.city.gpkg, layer='gps_traces', driver='GPKG', encoding='ISO-8859-1')
             except: gdf = gpd.GeoDataFrame(columns=['file'])
 
+            files = []
             for i, b in enumerate(boundaries):
                 min_ln, min_lt, max_ln, max_lt = b.bounds
 
@@ -544,33 +564,57 @@ class GeoScraper:
                 # Start downloading
                 for j in range(init, 100000):
                     page = j
+                    file_name = f"{i}_{page}.gpx"
                     url = f"http://api.openstreetmap.org/api/0.6/trackpoints?bbox={min_ln},{min_lt},{max_ln},{max_lt}&page={page}"
+
+                    if file_name in gdf['file'].unique() or file_name in os.listdir(directory):
+                        print(f"> {file_name} found, passing to next file")
+                    else:
+                        try:
+                            # Scrape data from OSM
+                            print(f"> Saving trace {file_name} from {url}")
+                            u = request.urlopen(url)
+                            buffer = u.read()
+
+                            # Write requested data into file
+                            if len(buffer) < 300:
+                                print(f"File size of {len(buffer)} is too small, jumping to next space")
+                                break
+                            else:
+                                f = open(f"{directory}/{file_name}", 'wb')
+                                f.write(buffer)
+                                f.close()
+                                files.append(file_name)
+                                time.sleep(1)
+                                gc.collect()
+                        except: print("> Traces downloaded, but not written to database")
+
+            len_un = len(gdf['file'].unique())
+            print(f"\n{len_un} traces found in the database")
+
+            files_list = os.listdir(directory)
+            for i, file in enumerate(files_list):
+                if file not in gdf['file'].unique():
+                    # Read and reproject downloaded trace
                     try:
-                        file_name = f"{i}_{page}.gpx"
-                        print(f"Saving trace {file_name} from {url}")
+                        print(f"> Reading and reprojecting trace from file {file} ({i+1}/{len(files_list)-len_un})")
+                        gpx = gpd.read_file(f"{directory}/{file}", layer='track_points', encoding='ISO-8859-1')
+                        gpx['file'] = file
+                        gpx.crs = 4326
+                        gpx = gpx.to_crs(epsg=self.city.crs)
+                        gdf = pd.concat([gdf, gpx])
+                    except: print(f"> Failed to read or reproject traces from file {file}")
 
-                        u = request.urlopen(url)
-                        buffer = u.read()
+                    # Merge into existing database
+                    gdf = gdf.reset_index(drop=True)
+                    gc.collect()
 
-                        if len(buffer) < 300:
-                            print(f"File size of {len(buffer)} is too small, jumping to next space")
-                            break
-                        else:
-                            f = open(f"{directory}/{file_name}", 'wb')
-                            f.write(buffer)
-                            f.close()
-                            time.sleep(1)
-                            if file_name not in gdf['file'].unique():
-                                gdf1 = gpd.read_file(f"{directory}/{file_name}", layer='track_points')
-                                gdf1['file'] = file_name
-                                gdf1.crs = 4326
-                                gdf1.to_crs(epsg=self.city.crs, inplace=True)
-                                gdf = pd.concat([gdf, gdf1])
-                                gdf.drop_duplicates(inplace=True)
-                                gdf.to_file(self.city.gpkg, layer='gps_traces')
-                    except error.HTTPError as e:
-                        print("Download stopped; HTTP Error - %s" % e.code)
-                        break
+            try:
+                gdf = gdf.drop_duplicates()
+                gdf = gdf[gdf.geometry.is_valid]
+                print(f"> Writing downloaded data to GeoPackage")
+                gdf.to_file(self.city.gpkg, layer='gps_traces', driver='GPKG', encoding='ISO-8859-1')
+            except: print(f"!!! Failed to write data to GeoPackage !!!")
             return gdf
 
     def public_transit(self, run=True, date='2016-09-05'):
@@ -1054,7 +1098,7 @@ class Canada:
         if census:
             for province in self.provinces:
                 for city in province.cities:
-                    print(f"Downloading {city.city_name}'s dissemination area")
+                    print(f"Downloading {city.city_name}'s dissemination areas from StatsCan")
                     profile_url = "https://www12.statcan.gc.ca/census-recensement/2016/dp-pd/hlt-fst/pd-pl/Tables/CompFile.cfm?Lang=Eng&T=1901&OFT=FULLCSV"
                     boundary_url = "http://www12.statcan.gc.ca/census-recensement/2011/geo/bound-limit/files-fichiers/2016/lda_000b16a_e.zip"
 
@@ -1077,6 +1121,8 @@ class Canada:
                     # Join DataFrames
                     df = pd.read_csv(f'{c_dir}lda_profile.csv', encoding="ISO-8859-1")
                     df['DAUID'] = df['Geographic code']
+                    df = df.rename(columns={"Population density per square kilometer, 2016": "population_den",
+                        "Total private dwellings, 2016": "n_dwellings"})
                     jda = census_da.merge(df, on='DAUID')
 
                     # Crop data to City boundary
@@ -1103,7 +1149,7 @@ class Canada:
                             .iloc[1:].set_index('level_1').transpose().reset_index(drop=True)
 
                         # Pre process Education
-                        df = pd.read_csv(f"{csd}-{da}-Education.csv")
+                        df = pd.read_csv(f"{csd}-{da}-Education.csv", encoding='ISO-8859-1')
                         df_ed = clean(df)
                         df_ed_degrees = df_ed.iloc[:, 1:5]
                         df_ed_areas = df_ed.iloc[: , 32:93].loc[:, [
@@ -1144,10 +1190,14 @@ class Canada:
                         df_ed['secondary_ratio'] = df_ed['secondary']/df_ed['ed_total']
                         df_ed['postsecondary_ratio'] = df_ed['postsecondary']/df_ed['ed_total']
                         df_ed['no_postsecondary_ratio'] = df_ed['no_postsecondary']/df_ed['ed_total']
+                        df_ed_div = df_ed.loc[:, ['education', 'arts', 'humanities', 'social', 'business', 'natural',
+                            'information', 'engineering', 'agriculture', 'health', 'protective']]
+                        df_ed['diversity_educ_sh'] = diversity.alpha_diversity('shannon', df_ed_div)
+                        df_ed['diversity_educ_si'] = diversity.alpha_diversity('simpson', df_ed_div)
                         df_ed['DAUID'] = da
 
                         # Pre process Housing
-                        df = pd.read_csv(f"{csd}-{da}-Housing.csv")
+                        df = pd.read_csv(f"{csd}-{da}-Housing.csv", encoding='ISO-8859-1')
                         df_ho = clean(df)
                         df_ho_gen = df_ho.iloc[:, 1:35]
                         df_ho_aff = df_ho.iloc[:, 58:67]
@@ -1199,13 +1249,17 @@ class Canada:
                         df_ho['1_plus_person_per_room_ratio'] = df_ho['More than 1 person per room']/df_ho['total_people_per_room']
                         df_ho['suitable_ratio'] = df_ho['Suitable']/df_ho['total_suitability']
                         df_ho['not_suitable_ratio'] = df_ho['Not suitable'] / df_ho['total_suitability']
-                        df_ho['age_before_1960_ratio'] = df_ho['1960 or before']/df_ho['total_period']
-                        df_ho['age_1961_1980_ratio'] = df_ho['1961 to 1980']/df_ho['total_period']
-                        df_ho['age_1981_1990_ratio'] = df_ho['1981 to 1990']/df_ho['total_period']
-                        df_ho['age_1991_2000_ratio'] = df_ho['1991 to 2000']/df_ho['total_period']
-                        df_ho['age_2001_2005_ratio'] = df_ho['2001 to 2005']/df_ho['total_period']
-                        df_ho['age_2006_2010_ratio'] = df_ho['2006 to 2010']/df_ho['total_period']
-                        df_ho['age_2011_2016_ratio'] = df_ho['2011 to 2016']/df_ho['total_period']
+                        df_bad = df_ho.loc[:, ['1960 or before', '1961 to 1980', '1981 to 1990', '2001 to 2005',
+                            '2006 to 2010', '2011 to 2016']]
+                        df_ho['building_age_div_si'] = diversity.alpha_diversity("simpson", df_bad)
+                        df_ho['building_age_div_sh'] = diversity.alpha_diversity("shannon", df_bad)
+                        df_ddr = df_ho.loc[:, ['1 to 4 rooms', '5 rooms', '6 rooms', '7 rooms', '8 or more rooms']]
+                        df_ho['dwelling_div_rooms_si'] = diversity.alpha_diversity("simpson", df_ddr)
+                        df_ho['dwelling_div_rooms_sh'] = diversity.alpha_diversity("shannon", df_ddr)
+                        df_ddb = df_ho.loc[:, ['No bedrooms', '1 bedroom', '2 bedrooms',
+                            '3 bedrooms', '4 or more bedrooms']]
+                        df_ho['dwelling_div_bedrooms_si'] = diversity.alpha_diversity("simpson", df_ddb)
+                        df_ho['dwelling_div_bedrooms_sh'] = diversity.alpha_diversity("shannon", df_ddb)
                         df_ho['DAUID'] = da
 
                         # Pre process Income
@@ -1239,10 +1293,26 @@ class Canada:
                             '  With after-tax income':'with_income_at',
                             '  Percentage with after-tax income':'income_ratio_at'
                         }).astype(float, errors='ignore')
+                        df_dic = df_in.loc[:, [
+                            '    Under $10;000 (including loss)',
+                            '    $10;000 to $19;999',
+                            '    $20;000 to $29;999',
+                            '    $30;000 to $39;999',
+                            '    $40;000 to $49;999',
+                            '    $50;000 to $59;999',
+                            '    $60;000 to $69;999',
+                            '    $70;000 to $79;999',
+                            '    $80;000 and over',
+                            '      $80;000 to $89;999',
+                            '      $90;000 to $99;999',
+                            '      $100;000 and over'
+                        ]]
+                        df_in['income_div_si'] = diversity.alpha_diversity("simpson", df_dic)
+                        df_in['income_div_sh'] = diversity.alpha_diversity("shannon", df_dic)
                         df_in['DAUID'] = da
 
                         # Pre process Journey to Work
-                        df = pd.read_csv(f"{csd}-{da}-Journey%20to%20work.csv")
+                        df = pd.read_csv(f"{csd}-{da}-Journey%20to%20work.csv", encoding='ISO-8859-1')
                         df = df.loc['Main mode of commuting']['Unnamed: 0']
                         dic = {i[0]: [i[2]] for i in df.index}
                         df_jw = pd.DataFrame.from_dict(dic)
@@ -1625,6 +1695,8 @@ class BritishColumbia:
 
                     # Create stop geometries
                     stops['geometry'] = [Point(lon, lat) for lon, lat in zip(stops.stop_lon, stops.stop_lat)]
+                    stops['z_id'] = stops['zone_id']
+                    stops = stops.drop('zone_id', axis=1)
                     stops_gdf = gpd.GeoDataFrame(stops, geometry='geometry')
                     stops_gdf = stops_gdf.dropna(subset=['frequency', 'geometry'], axis=0)[stops_gdf.geometry.is_valid]
                     stops_gdf = stops_gdf.reset_index(drop=True)
@@ -1632,9 +1704,32 @@ class BritishColumbia:
                     # Reproject and export
                     stops_gdf.crs = 4326
                     stops_gdf = stops_gdf.to_crs(city.crs)
-                    stops_gdf.to_file(city.gpkg, layer='network_transit')
+                    stops_gdf.to_file(city.gpkg, layer='network_stops')
                     print(f"Transit stops for {city.municipality} saved at 'network_transit' layer")
         return
+
+    def get_air_quality(self):
+        url = "http://www.env.gov.bc.ca/epd/bcairquality/aqo/csv/bc_air_monitoring_stations.csv"
+        fp = download_file(url=url, file_path=f"Databases/OpenDataBC/{url.split('/')[-1]}")
+
+        df = pd.read_csv(fp)
+
+        for city in self.cities:
+            # Load and reproject data
+            gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.LONGITUDE, df.LATITUDE))
+            gdf.crs = 4326
+            gdf = gdf.to_crs(city.crs)
+
+            # Reproject city boundary
+            bound = city.boundary.to_crs(city.crs)
+
+            # Join data within bounds
+            try: gdf = gpd.overlay(gdf, bound, how='intersection')
+            except: pass
+            if len(gdf) > 0:
+                gdf.to_file(city.gpkg, layer='bc_air_quality')
+                print(f"Air quality data downloaded with {len(gdf)} features for {city.municipality}")
+            else: print(f"Air quality not downloaded for {city.municipality}")
 
 
 class Vancouver:
@@ -1673,9 +1768,11 @@ class Vancouver:
                 except: pieces = pdf
                 pieces = pieces.split('/')
                 filename = '_'.join(pieces)
+                print(f"> Downloading and saving {filename}")
                 response = requests.get(pdf)
                 with open(f'{self.directory}{filename}', 'wb') as f:
                     f.write(response.content)
-                print(f"{filename} saved")
+                print(f"> {filename} downloaded and saved")
+
         print(str(len(pdfs)) + ' permit documents downloaded at ' + str(datetime.datetime.now()))
         return
