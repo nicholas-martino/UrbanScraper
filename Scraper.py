@@ -30,8 +30,9 @@ import io
 import json
 import logging
 import os
+import random
+import re
 import time
-import timeit
 import zipfile
 from io import StringIO
 from urllib import request, parse
@@ -42,20 +43,18 @@ import pandas as pd
 import regex
 import requests
 import selenium.webdriver as webdriver
-from Learning.Scraping import Scraper
-# from Statistics.basic_stats import normalize
-# from Visualization import polar_chart as pc
+
 from bs4 import BeautifulSoup
 from craigslist import CraigslistHousing
-from elementslab.Analyst import GeoBoundary
 from geopy.geocoders import Nominatim
+from lxml import html
 from nltk import word_tokenize
-from nltk.corpus import stopwords
-from nltk.stem import WordNetLemmatizer
-from pdfminer.converter import TextConverter
-from pdfminer.layout import LAParams
-from pdfminer.pdfinterp import PDFResourceManager, PDFPageInterpreter
-from pdfminer.pdfpage import PDFPage
+# from nltk.corpus import stopwords
+# from nltk.stem import WordNetLemmatizer
+# from pdfminer.converter import TextConverter
+# from pdfminer.layout import LAParams
+# from pdfminer.pdfinterp import PDFResourceManager, PDFPageInterpreter
+# from pdfminer.pdfpage import PDFPage
 from selenium.webdriver.firefox.options import Options
 from shapely import wkt
 from shapely.geometry import *
@@ -63,6 +62,7 @@ from skbio import diversity
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.preprocessing import LabelEncoder
+# from spacy.util import minibatch, compounding
 
 
 def download_file(url, file_path):
@@ -78,21 +78,80 @@ def download_file(url, file_path):
     return file_path
 
 
+class Scraper:
+    def __init__(self, driver='/opt/anaconda3/bin/geckodriver', timeout=0):
+        options = Options()
+        options.set_preference("browser.download.folderList", 1)
+        options.set_preference("browser.download.manager.showWhenStarting", False)
+        options.set_preference("browser.helperApps.neverAsk.saveToDisk", "text/csv")
+        options.set_preference("browser.helperApps.neverAsk.saveToDisk", "application/pdf")
+        options.set_preference("pdfjs.disabled", True)
+        driver = webdriver.Firefox(executable_path=driver, options=options)
+        driver.minimize_window()
+        if timeout != 0:
+            driver.set_page_load_timeout(timeout)
+        self.driver = driver
+
+    def get_sublinks(self, url):
+        # Get all link elements at a given url
+        try:
+            self.driver.get(url)
+            self.driver.implicitly_wait(1)
+            elements = self.driver.find_elements_by_tag_name('a')
+            links = []
+            for element in elements:
+                try:
+                    link = element.get_attribute('href')
+                    links.append(link)
+                except: pass
+            for link in links:
+                if (link == None) or (link == 'None'):
+                    links.remove(link)
+            return links
+        except:
+            return None
+
+    def download_files(self, url, path, format='.pdf'):
+        # Get all files of a given format at a given url
+        links = self.get_sublinks(url)
+        filenames = []
+        for link in links:
+            if format in link:
+                directory = path.split('/')[0]
+                local_filename = path + '_' + url.split('/')[-1]
+                filenames.append(local_filename)
+                with requests.get(link, stream=True) as r:
+                    r.raise_for_status()
+                    with open(local_filename, 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            if chunk:  # filter out keep-alive new chunks
+                                f.write(chunk)
+        return filenames
+
+    def close_session(self):
+        self.driver.close()
+
+
 class GeoScraper:
     """Web scraping GeoSpatial data"""
-    def __init__(self, city):
+    def __init__(self, city, directory='/Volumes/Samsung_T5/Databases/', crs=26910):
         self.city = city
-        print(f"Scraping data for elements within {city.municipality}\n")
+        self.dir = directory
+        self.crs = crs
+        print(f"Scraping data for elements within {city}\n")
 
     # Scrape built environment
     def buildings_osm(self):
         return self
 
+    def blocks_osm(self):
+        return
+
     # Scrape affordability and vitality indicators
     def employment_craigslist(self):
         return self
 
-    def employment_indeed(self, run=True, n_pages=3):
+    def employment_indeed(self, run=True, n_pages=1):
         if run:
             print(f"> Downloading employment posts from Indeed")
 
@@ -106,7 +165,7 @@ class GeoScraper:
 
             data = {'job': [], 'time': [], 'salary': [], 'company': [], 'geometry': []}
             for i in range(start, n_pages):
-                url = f"https://www.indeed.ca/jobs?q=&l={name}&start={i*20}"
+                url = f"https://www.indeed.ca/jobs?q=&l={name}&start={i*10}"
 
                 # Access and parse the page
                 page = requests.get(url)
@@ -154,7 +213,7 @@ class GeoScraper:
                             data['company'].append(span.text.strip())
 
                 # Clean street names from OSM
-                c_links = gpd.read_file(self.city.gpkg, layer='network_links')
+                c_links = gpd.read_file(f"{self.dir}{self.city.municipality}.gpkg", layer='network_links', driver='GPKG')
                 cl_strs = [i.replace("Avenue", "").replace("Street", "").replace("Road", "").replace("Drive", "").strip(" ")
                            for i in list(c_links) if i is not None]
 
@@ -203,46 +262,66 @@ class GeoScraper:
                     locator = Nominatim(user_agent="myGeocoder")
                     try: geom = Point(locator.geocode(f"{address}, {self.city.municipality}")[1])
                     except:
-                        try: geom = Point(locator.geocode(f"{address}, {self.city.city_name}")[1])
+                        try: geom = Point(locator.geocode(f"{address}, {self.city.municipality}")[1])
                         except: geom = 'Unknown'
                     data['geometry'].append(geom)
 
             # Close web browser
-            s.driver.close()
+            s.close_session()
 
             # Export to GeoPackage
-            try: gdf = gpd.GeoDataFrame().from_dict(data)
-            except: pass
+            gdf = gpd.GeoDataFrame().from_dict(data)
             gdf = gdf.loc[gdf['geometry'] != 'Unknown']
             gdf['geometry'] = [Point(t.y, t.x) for t in gdf.geometry]
             gdf = gdf.set_geometry('geometry')
             gdf.crs = 4326
-            gdf.to_crs(epsg=self.city.crs, inplace=True)
-            self.city.boundary.to_crs(epsg=self.city.crs, inplace=True)
+            gdf.to_crs(epsg=self.crs, inplace=True)
+            # self.city.boundary.to_crs(epsg=self.crs, inplace=True)
             gdf['date'] = str(datetime.datetime.now().date())
-            try:
-                gdf0 = gpd.read_file(f"{self.city.directory}Databases/Indeed/{self.city.municipality}.geojson", driver='GeoJSON', encoding="ISO-8859-1").copy()
-                gdf = pd.concat([gdf0, gdf])
-            except: pass
-            gdf = gdf.loc[:, ['job', 'time', 'salary', 'company', 'date', 'geometry']]
+
+            gdf0 = gpd.read_file(f"{self.dir}Indeed/{self.city.municipality}.geojson", driver='GeoJSON', encoding="ISO-8859-1").copy()
+            gdf = pd.concat([gdf0, gdf]).reset_index(drop=True)
+
+            def range_mean(rng):
+                if ',' in rng: rng = rng.replace(',', '')
+                numerical = [float(r.split('$')[1]) if '$' in r else float(r) for r in rng.split(' - ')]
+                return sum(numerical) / len(numerical)
+
+            # Convert income data to numerical
+            for i in gdf.index:
+                if gdf.at[i, 'salary'] != 'Unknown':
+                    for time_frame, den in {' a year': 1, ' a month': 12, ' a week': 40, ' a day': 200, ' an hour': (6 * 200)}.items():
+                        if time_frame in gdf.at[i, 'salary']:
+                            salary = gdf.at[i, 'salary'].strip().split(time_frame)[0]
+                            for j in [',', '\n']:
+                                if j in salary: salary = salary.replace(j, '')
+                            if ' - ' in salary: salary = range_mean(salary) * den
+                            else: salary = float(salary.split("$")[1]) * den
+                    gdf.at[i, 'salary_n'] = salary
+
+            gdf = gdf.loc[:, ['job', 'time', 'salary', 'salary_n', 'company', 'date', 'geometry']]
             gdf = gdf.drop_duplicates(subset=['job'])
-            gdf = gdf.reset_index()
+            gdf = gdf.reset_index(drop=True)
             if len(gdf) > 0:
-                gdf.to_file(f"{self.city.directory}Databases/Indeed/{self.city.municipality}.geojson", driver='GeoJSON')
+                gdf.to_file(f"{self.dir}/Indeed/{self.city.municipality}.geojson", driver='GeoJSON')
                 try:
-                    gdf.to_file(self.city.gpkg, layer='indeed_employment')
+                    gdf.to_file(f"{self.dir}{self.city.municipality}.gpkg", layer='indeed_employment', driver='GPKG')
                     print(f"> Employment data downloaded from Indeed and saved on {self.city.municipality} database with {len(gdf)} data points")
-                except: print(f"!!! Employment data not downloaded from Indeed !!!")
-        return self
+                except: print(f"!!! Employment data from Indeed not saved on GeoPackage !!!")
+            return gdf
 
     def housing_craigslist(self, site, n_results, run=True):
-        print(f"Downloading {self.city.city_name}'s housing posts from Craigslist")
+        print(f"Downloading {self.city.municipality}'s housing posts from Craigslist")
 
         if run:
             try:
                 cl = CraigslistHousing(site=site)
                 results = cl.get_results(sort_by='newest', geotagged=True, limit=n_results)
+            except:
+                print("!!! Craigslist download failed :(")
+                results = None
 
+            if results is not None:
                 # List results
                 uid = []
                 name = []
@@ -257,7 +336,8 @@ class GeoScraper:
                     area.append(result['area'])
                     brooms.append(result['bedrooms'])
                     coords.append(result['geotag'])
-                    price.append(float(result[('price')][1:]))
+                    try: price.append(float(result[('price')][1:]))
+                    except: price.append(float(result[('price')][1:].replace(',','')))
                     dates.append(result['datetime'])
                     # print (result)
 
@@ -291,20 +371,23 @@ class GeoScraper:
                 cl_gdf = gpd.GeoDataFrame(df, geometry='geometry')
                 cl_gdf.crs = 4326
 
+                # Filter area and bedrooms None
+                cl_gdf = cl_gdf[(cl_gdf['area'] != None) & (cl_gdf['bedrooms'] != None)]
+
                 # Calculate Price/Area
-                cl_gdf['area'] = cl_gdf['area'].str[:-3].astype(float)
+                cl_gdf['area'] = cl_gdf['area'].astype(float)
                 cl_gdf['price_sqft'] = cl_gdf['price'] / cl_gdf['area']
 
                 # Get Vancouver Boundary
-                van_gdf = ox.gdf_from_place(self.city.municipality)
+                van_gdf = ox.geocode_to_gdf(self.city.municipality)
                 van_gdf.crs = 4326
-                van_gdf.to_crs(epsg=self.city.crs)
+                van_gdf.to_crs(epsg=self.crs)
                 van_pol = van_gdf.geometry[0]
                 if van_pol is None: print('Administrative boundary download failed :(')
 
                 # Filter data
                 pd.set_option('display.min_rows', 10)
-                cl_gdf.to_crs(epsg=self.city.crs)
+                cl_gdf.to_crs(epsg=self.crs)
                 cl_gdf = cl_gdf[cl_gdf.within(van_pol)]
                 csv_path = '__pycache__/' + self.city.municipality + '_Craigslist.csv'
                 cl_gdf = cl_gdf[cl_gdf['area'] > 270]
@@ -312,37 +395,36 @@ class GeoScraper:
                 # Write data in csv
                 with io.open(csv_path, "a", encoding="utf-8") as f:
                     cl_gdf.to_csv(f, header=False, index=False)
-                try:
-                    df = pd.read_csv(csv_path)
-                    df = df.drop_duplicates()
-                    df.to_csv(csv_path, header=False, index=False)
+                df = pd.read_csv(csv_path)
+                df = df.drop_duplicates()
+                df.to_csv(csv_path, header=False, index=False)
 
-                    # Write data in GeoPackage
-                    df = pd.read_csv(csv_path, encoding="utf8")
-                    df.columns = ['index', 'description', 'price', 'area', 'bedrooms', 'geometry', 'date', 'price_sqft']
-                    numerics = ['price', 'area', 'bedrooms', 'price_sqft']
-                    for i in numerics: pd.to_numeric(df[i], errors='coerce').fillna(0).astype(float)
-                    gdf = gpd.GeoDataFrame(df)
-                    gdf['geometry'] = gdf['geometry'].apply(wkt.loads)
-                    gdf.set_geometry('geometry')
-                    gdf.crs = 4326
-                    try:
-                        cl_cur = gpd.read_file(self.city.gpkg, layer='craigslist_housing', driver='GPKG')
-                        try: cl_cur.drop('fid', inplace=True)
-                        except: pass
-                        gdf = pd.concat([cl_cur, gdf])
-                        gdf.drop_duplicates(inplace=True)
-                        print(f"Craigslist data for {self.city.city_name} downloaded and joined")
-                    except: pass
-                    gdf.to_file('Databases/' + self.city.municipality + '.gpkg', layer='craigslist_housing', driver="GPKG")
-                    print(f"Craigslist data for {self.city.city_name} exported to GeoPackage")
+                # Write data in GeoPackage
+                df = pd.read_csv(csv_path, encoding="utf8")
+                df.columns = ['index', 'description', 'price', 'area', 'bedrooms', 'geometry', 'date', 'price_sqft']
+                numerics = ['price', 'area', 'bedrooms', 'price_sqft']
+                for i in numerics: pd.to_numeric(df[i], errors='coerce').fillna(0).astype(float)
+                gdf = gpd.GeoDataFrame(df)
+                gdf['geometry'] = gdf['geometry'].apply(wkt.loads)
+                gdf.set_geometry('geometry')
+                gdf.crs = 4326
 
-                except:
-                    gdf = None
-                    print(f"Failed to process craigslist data for {self.city.city_name} :(")
-                    pass
+                # Read existing data
+                try: cl_cur = gpd.read_file(f"{self.dir}{self.city.municipality}.gpkg", layer='craigslist_housing', driver='GPKG')
+                except: cl_cur = gpd.GeoDataFrame()
+                try: cl_cur.drop('fid', inplace=True)
+                except: pass
+                gdf = pd.concat([cl_cur, gdf])
+                gdf.drop_duplicates(inplace=True)
+                print(f"Craigslist data for {self.city.municipality} downloaded and joined with {len(gdf)} data points :)")
+
+                # Separate buy and rent posts
+                gdf.to_file(f"{self.dir}{self.city.municipality}.gpkg", layer='craigslist_housing', driver="GPKG")
+                gdf = gdf[(gdf['price'] > 100) & (gdf['price'] < 50000)]
+                gdf.to_file(f"{self.dir}{self.city.municipality}.gpkg", layer='craigslist_rent', driver="GPKG")
+                print(f"Craigslist data for {self.city.municipality} exported to GeoPackage")
+
                 return gdf
-            except: print(f"Failed to process craigslist data for {self.city.city_name} :(")
 
     def housing_zillow(self, url='https://www.zillow.com/homes/british-columbia_rb/'):
 
@@ -776,11 +858,11 @@ class GeoScraper:
             gdf = gpd.read_file(OUTFILE)
 
             try:
-                gdf0 = gpd.read_file(self.city.gpkg, layer='public_transit')
+                gdf0 = gpd.read_file(self.city.gpkg, layer='public_transit', driver='GPKG')
                 gdf = pd.concat([gdf0, gdf])
             except: pass
 
-            gdf.to_file(self.city.gpkg, layer='public_transit')
+            gdf.to_file(self.city.gpkg, layer='public_transit', driver='GPKG')
             return print('> Public transit frequency downloaded and stored')
 
     def social_twitter(self):
@@ -1102,7 +1184,7 @@ class Canada:
                     profile_url = "https://www12.statcan.gc.ca/census-recensement/2016/dp-pd/hlt-fst/pd-pl/Tables/CompFile.cfm?Lang=Eng&T=1901&OFT=FULLCSV"
                     boundary_url = "http://www12.statcan.gc.ca/census-recensement/2011/geo/bound-limit/files-fichiers/2016/lda_000b16a_e.zip"
 
-                    c_dir = f"{city.directory}StatsCan/"
+                    c_dir = f"{city.directory}/Databases/StatsCan/"
                     if not os.path.exists(c_dir): os.makedirs(c_dir)
 
                     os.chdir(c_dir)
@@ -1135,13 +1217,12 @@ class Canada:
                     out_df = pd.DataFrame()
                     for i, (da, csd) in enumerate(zip(city.DAs['DAUID'], city.DAs['CSDUID'])):
                         print(f"DA: {da} ({i+1} / {len(city.DAs['DAUID'])+1})")
-                        for data in ['Education', 'Housing', 'Income', 'Journey%20to%20work', 'Labour']:
-
-                            print(f"> Downloading {data}")
-                            base_url = f'https://www12.statcan.gc.ca/census-recensement/2016/dp-pd/prof/details/download-telecharger/current-actuelle.cfm?Lang=E&Geo1=DA&Code1={da}&Geo2=CSD&Code2={csd}&B1={data}&type=0&FILETYPE=CSV'
-                            try: download_file(base_url, f"{csd}-{da}-{data}.csv")
+                        for d in ['Education', 'Ethnic%20Origin', 'Housing', 'Income', 'Journey%20to%20work', 'Labour']:
+                            print(f"> Downloading {d}")
+                            base_url = f'https://www12.statcan.gc.ca/census-recensement/2016/dp-pd/prof/details/download-telecharger/current-actuelle.cfm?Lang=E&Geo1=DA&Code1={da}&Geo2=CSD&Code2={csd}&B1={d}&type=0&FILETYPE=CSV'
+                            try: download_file(base_url, f"{csd}-{da}-{d}.csv")
                             except:
-                                print(f"> Download from {data} data failed for DA {da} at CSD {csd}")
+                                print(f"> Download from {d} data failed for DA {da} at CSD {csd}")
                                 pass
 
                         # Pre process base funcion
@@ -1192,9 +1273,45 @@ class Canada:
                         df_ed['no_postsecondary_ratio'] = df_ed['no_postsecondary']/df_ed['ed_total']
                         df_ed_div = df_ed.loc[:, ['education', 'arts', 'humanities', 'social', 'business', 'natural',
                             'information', 'engineering', 'agriculture', 'health', 'protective']]
-                        df_ed['diversity_educ_sh'] = diversity.alpha_diversity('shannon', df_ed_div)
-                        df_ed['diversity_educ_si'] = diversity.alpha_diversity('simpson', df_ed_div)
+                        df_ed['educ_div_sh'] = diversity.alpha_diversity('shannon', df_ed_div)
+                        df_ed['educ_div_si'] = diversity.alpha_diversity('simpson', df_ed_div)
                         df_ed['DAUID'] = da
+
+                        # Pre process Ethnic Origins
+                        profile = download_file(f'https://www12.statcan.gc.ca/census-recensement/2016/dp-pd/prof/details/download-telecharger/current-actuelle.cfm?Lang=E&Geo1=DA&Code1={da}&Geo2=CSD&Code2={csd}&B1=All&type=0&FILETYPE=CSV', f"{csd}-{da}-Profile.csv")
+                        df = pd.read_csv(profile, encoding='ISO-8859-1', error_bad_lines=False)
+                        df_age1 = df.loc['Age characteristics'].iloc[2:4]
+                        df_age2 = df.loc['Age characteristics'].iloc[6:15]
+                        df_age3 = df.loc['Age characteristics'].iloc[17:21]
+                        df_age4 = df.loc['Age characteristics'].iloc[23:26]
+                        df_age = pd.concat([df_age1, df_age2, df_age3, df_age4])
+                        counts = []
+                        for i in df_age.index:
+                            try: counts.append(int(i[2]))
+                            except: counts.append(0)
+                        df_ag = pd.DataFrame()
+                        if sum(counts) == 0:
+                            df_ag.at[0, 'age_div_sh'] = 0
+                            df_ag.at[0, 'age_div_sh'] = 0
+                        else:
+                            df_ag.at[0, 'age_div_sh'] = diversity.alpha_diversity('shannon', counts)[0]
+                            df_ag.at[0, 'age_div_sh'] = diversity.alpha_diversity('simpson', counts)[0]
+                        df_ag['DAUID'] = da
+
+                        indices = [1, 5, 15, 89, 110, 135, 203, 269]
+                        df_eth = df.loc['Ethnic origin population'].iloc[indices]
+                        df_et = pd.DataFrame()
+                        counts = []
+                        for i in df_eth.index:
+                            try: counts.append(int(i[2]))
+                            except: counts.append(0)
+                        if sum(counts) == 0:
+                            df_et.at[0, 'ethnic_div_sh'] = 0
+                            df_et.at[0, 'ethnic_div_si'] = 0
+                        else:
+                            df_et.at[0, 'ethnic_div_sh'] = diversity.alpha_diversity('shannon', counts)[0]
+                            df_et.at[0, 'ethnic_div_si'] = diversity.alpha_diversity('simpson', counts)[0]
+                        df_et['DAUID'] = da
 
                         # Pre process Housing
                         df = pd.read_csv(f"{csd}-{da}-Housing.csv", encoding='ISO-8859-1')
@@ -1342,7 +1459,7 @@ class Canada:
                         df_lb['DAUID'] = da
 
                         # Append data to gdf
-                        joi_df = pd.concat([df_ed, df_ho, df_in, df_jw, df_lb], axis=1)
+                        joi_df = pd.concat([df_ag, df_et, df_ed, df_ho, df_in, df_jw, df_lb], axis=1)
                         out_df = pd.concat([out_df, joi_df], axis=0)
 
                     # Join data to dissemination areas
@@ -1366,413 +1483,221 @@ class Canada:
                     city.DAs = city.DAs.merge(ratios, on='DAUID', suffixes=[None, None], how='outer')
 
                     # Save it to GeoPackage
-                    city.DAs.to_file(city.gpkg, layer='land_dissemination_area')
+                    city.DAs.to_file(city.gpkg, layer='land_dissemination_area', driver='GPKG')
                     print(f'Census dissemination area downloaded and saved at {city.gpkg}')
-
-
-class BritishColumbia:
-    def __init__(self, cities):
-        self.cities = [GeoBoundary(f"{city}, British Columbia") for city in cities]
-        print("\n### Class British Columbia created ###\n\n")
-
-    def update_databases(self, icbc=True):
-
-        # Check if ICBC crash data exists and join it from ICBC database if not
-        if icbc:
-            for city in self.cities:
-                try:
-                    city.crashes = gpd.read_file(city.gpkg, layer='network_accidents')
-                    print(city.city_name + ' ICBC data read from database')
-                except:
-                    source = 'https://public.tableau.com/profile/icbc#!/vizhome/LowerMainlandCrashes/LMDashboard'
-                    print('Adding ICBC crash data to ' + city.city_name + ' database')
-                    df = city.merge_csv(f"{city.directory}Databases/ICBC/")
-                    geometry = [Point(xy) for xy in zip(df['Longitude'], df['Latitude'])]
-                    gdf = gpd.GeoDataFrame(df, geometry=geometry)
-                    gdf.crs = 4326
-                    gdf.to_crs(epsg=city.crs, inplace=True)
-                    city.boundary.to_crs(epsg=city.crs, inplace=True)
-                    matches = gpd.sjoin(gdf, city.boundary, op='within')
-                    try: matches.to_file(city.gpkg, layer='icbc_accidents', driver='GPKG')
-                    except: pass
-
-    # BC Assessment
-    def aggregate_bca_from_field(self, run=True, join=True, classify=True, inventory_dir='', geodatabase_dir=''):
-        if run:
-            for city in self.cities:
-                start_time = timeit.default_timer()
-                if join:
-                    print('> Geoprocessing BC Assessment data from JUROL number')
-                    inventory = inventory_dir
-                    df = pd.read_csv(inventory)
-
-                    # Load and process Roll Number field on both datasets
-                    gdf = gpd.read_file(geodatabase_dir, layer='ASSESSMENT_FABRIC')
-
-                    # Reproject coordinate system
-                    gdf.crs = 3005
-                    gdf.to_crs(epsg=city.crs, inplace=True)
-                    city.boundary.to_crs(epsg=city.crs, inplace=True)
-
-                    # Create spatial index and perform join
-                    s_index = gdf.sindex
-                    gdf = gpd.sjoin(gdf, city.boundary, op='within')
-
-                    # Change feature types
-                    gdf['JUROL'] = gdf['JUROL'].astype(str)
-                    gdf = gdf[gdf.geometry.area > 71]
-                    df['JUR'] = df['JUR'].astype(int).astype(str)
-                    df['ROLL_NUM'] = df['ROLL_NUM'].astype(str)
-                    df['JUROL'] = df['JUR'] + df['ROLL_NUM']
-                    print(f'BCA spatial layer loaded with {len(gdf)} parcels')
-
-                    # Merge by JUROL field
-                    merged = pd.merge(gdf, df, on='JUROL')
-                    full_gdfs = {'0z': merged}
-                    print(f": {len(full_gdfs['0z'])}")
-
-                    # Test merge with variations of JUROL
-                    for i in range(1, 7):
-                        strings = []
-                        for n in range(i):
-                            strings.append('0')
-                        string = str(''.join(strings))
-                        df[string + 'z'] = string
-                        df['JUROL'] = df['JUR'] + string + df['ROLL_NUM']
-                        full_gdf = pd.merge(gdf, df, on='JUROL')
-                        full_gdf.drop([string + 'z'], axis=1)
-                        if len(full_gdf) > 0:
-                            full_gdfs[str(i) + 'z'] = full_gdf
-                        print(f"string: {len(full_gdf)}")
-
-                    # Merge and export spatial and non-spatial datasets
-                    out_gdf = pd.concat(full_gdfs.values(), ignore_index=True)
-                    out_gdf.to_file(city.gpkg, driver='GPKG', layer='land_assessment_fabric')
-                    print(len(out_gdf))
-
-                if classify:
-                    print("> Classifying land uses and parcel categories from BC Assessment")
-                    if not join: out_gdf = gpd.read_file(city.gpkg, driver='GPKG', layer='land_assessment_fabric')
-
-                    # Reclassify land uses for BC Assessment data
-                    uses = {'residential': ['000 - Single Family Dwelling',
-                                            '030 - Strata-Lot Residence (Condominium)',
-                                            '032 - Residential Dwelling with Suite',
-                                            '033 - Duplex, Non-Strata Side by Side or Front / Back',
-                                            '034 - Duplex, Non-Strata Up / Down',
-                                            '035 - Duplex, Strata Side by Side',
-                                            '036 - Duplex, Strata Front / Back',
-                                            '037 - Manufactured Home (Within Manufactured Home Park)',
-                                            '038 - Manufactured Home (Not In Manufactured Home Park)',
-                                            '039 - Row Housing (Single Unit Ownership)',
-                                            '040 - Seasonal Dwelling',
-                                            '041 - Duplex, Strata Up / Down',
-                                            '047 - Triplex',
-                                            '049 - Fourplex',
-                                            '050 - Multi-Family (Apartment Block)',
-                                            '052 - Multi-Family (Garden Apartment & Row Housing)',
-                                            '053 - Multi-Family (Conversion)',
-                                            '054 - Multi-Family (High-Rise)', '055 - Multi-Family (Minimal Commercial)',
-                                            '056 - Multi-Family (Residential Hotel)',
-                                            '057 - Stratified Rental Townhouse',
-                                            '058 - Stratified Rental Apartment (Frame Construction)',
-                                            '059 - Stratified Rental Apartment (Hi-Rise Construction)',
-                                            '060 - 2 Acres Or More (Single Family Dwelling, Duplex)',
-                                            '062 - 2 Acres Or More (Seasonal Dwelling)',
-                                            '063 - 2 Acres Or More (Manufactured Home)',
-                                            '234 - Manufactured Home Park',
-                                            '284 - Seniors Strata - Care',
-                                            '285 - Seniors Licensed Care',
-                                            '286 - Seniors Independent & Assisted Living'],
-                            'hospitality': ['042 - Strata-Lot Seasonal Dwelling (Condominium)',
-                                            '230 - Hotel',
-                                            '232 - Motel & Auto Court',
-                                            '233 - Individual Strata Lot (Hotel/Motel)',
-                                            '237 - Bed & Breakfast Operation 4 Or More Units',
-                                            '239 - Bed & Breakfast Operation Less Than 4 Units',
-                                            '238 - Seasonal Resort'],
-                            'retail': ['202 - Store(S) And Living Quarters',
-                                       '206 - Neighbourhood Store',
-                                       '209 - Shopping Centre (Neighbourhood)',
-                                       '211 - Shopping Centre (Community)',
-                                       '212 - Department Store - Stand Alone',
-                                       '213 - Shopping Centre (Regional)',
-                                       '214 - Retail Strip',
-                                       '215 - Food Market',
-                                       '216 - Commercial Strata-Lot',
-                                       '225 - Convenience Store/Service Station'],
-                            'entertainment': ['236 - Campground (Commercial)',
-                                              '250 - Theatre Buildings',
-                                              '254 - Neighbourhood Pub',
-                                              '256 - Restaurant Only',
-                                              '257 - Fast Food Restaurants',
-                                              '266 - Bowling Alley',
-                                              '270 - Hall (Community, Lodge, Club, Etc.)',
-                                              '280 - Marine Facilities (Marina)',
-                                              '600 - Recreational & Cultural Buildings (Includes Curling',
-                                              '610 - Parks & Playing Fields',
-                                              '612 - Golf Courses (Includes Public & Private)',
-                                              '614 - Campgrounds',
-                                              '654 - Recreational Clubs, Ski Hills',
-                                              '660 - Land Classified Recreational Used For'],
-                            'civic': ['210 - Bank',
-                                      '620 - Government Buildings (Includes Courthouse, Post Office',
-                                      '625 - Garbage Dumps, Sanitary Fills, Sewer Lagoons, Etc.',
-                                      '630 - Works Yards',
-                                      '634 - Government Research Centres (Includes Nurseries &',
-                                      '640 - Hospitals (Nursing Homes Refer To Commercial Section).',
-                                      '642 - Cemeteries (Includes Public Or Private).',
-                                      '650 - Schools & Universities, College Or Technical Schools',
-                                      '652 - Churches & Bible Schools'],
-                            'office': ['203 - Stores And/Or Offices With Apartments',
-                                       '204 - Store(S) And Offices',
-                                       '208 - Office Building (Primary Use)']
-                    }
-
-                    """
-                            'vacant': ['001 - Vacant Residential Less Than 2 Acres', '051 - Multi-Family (Vacant)',
-                                       '061 - 2 Acres Or More (Vacant)',
-                                       '111 - Grain & Forage (Vacant)',
-                                       '121 - Vegetable & Truck (Vacant)',
-                                       '201 - Vacant IC&I',
-                                       '421 - Vacant', '422 - IC&I Water Lot (Vacant)',
-                                       '601 - Civic, Institutional & Recreational (Vacant)'],
-                            'parking': ['020 - Residential Outbuilding Only', '029 - Strata Lot (Parking Residential)',
-                                        '043 - Parking (Lot Only, Paved Or Gravel-Res)',
-                                        '219 - Strata Lot (Parking Commercial)',
-                                        '260 - Parking (Lot Only, Paved Or Gravel-Com)', '262 - Parking Garage',
-                                        '490 - Parking Lot Only (Paved Or Gravel)'],
-                            'other': ['002 - Property Subject To Section 19(8)', '070 - 2 Acres Or More (Outbuilding)',
-                                      '190 - Other',
-                                      '200 - Store(S) And Service Commercial', '205 - Big Box',
-                                      '220 - Automobile Dealership', '222 - Service Station',
-                                      '224 - Self-Serve Service Station',
-                                      '226 - Car Wash', '227 - Automobile Sales (Lot)',
-                                      '228 - Automobile Paint Shop, Garages, Etc.',
-                                      '258 - Drive-In Restaurant', '288 - Sign Or Billboard Only',
-                                      '590 - Miscellaneous (Transportation & Communication)',
-                                      '615 - Government Reserves',
-                                      '632 - Ranger Station'],
-                            'agriculture': ['110 - Grain & Forage', '111 - Grain & Forage',
-                                            '120 - Vegetable & Truck', '130 - Tree Fruits',
-                                            '140 - Small Fruits', '150 - Beef', '160 - Dairy', '170 - Poultry',
-                                            '180 - Mixed',
-                                            '240 - Greenhouses And Nurseries (Not Farm Class)'],
-                            'industrial': ['031 - Strata-Lot Self Storage-Res Use',
-                                           '217 - Air Space Title',
-                                           '218 - Strata-Lot Self Storage-Business Use',
-                                           '272 - Storage & Warehousing (Open)',
-                                           '273 - Storage & Warehousing (Closed)', '274 - Storage & Warehousing (Cold)',
-                                           '275 - Self Storage', '276 - Lumber Yard Or Building Supplies',
-                                           '300 - Stratified Operational Facility Areas',
-                                           '400 - Fruit & Vegetable',
-                                           '401 - Industrial (Vacant)', '402 - Meat & Poultry', '403 - Sea Food',
-                                           '404 - Dairy Products', '405 - Bakery & Biscuit Manufacturing',
-                                           '406 - Confectionery Manufacturing & Sugar Processing', '408 - Brewery',
-                                           '409 - Winery',
-                                           '414 - Miscellaneous (Food Processing)',
-                                           '415 - Sawmills',
-                                           '416 - Planer Mills (When Separate From Sawmill)',
-                                           '418 - Shingle Mills',
-                                           '419 - Sash & Door',
-                                           '420 - Lumber Remanufacturing (When Separate From Sawmill)',
-                                           '423 - IC&I Water Lot (Improved)',
-                                           '424 - Pulp & Paper Mills (Incl Fine Paper, Tissue & Asphalt Roof)',
-                                           '425 - Paper Box, Paper Bag, And Other Paper Remanufacturing.',
-                                           '426 - Logging Operations, Incl Log Storage',
-                                           '428 - Improved',
-                                           '429 - Miscellaneous (Forest And Allied Industry)',
-                                           '434 - Petroleum Bulk Plants',
-                                           '445 - Sand & Gravel (Vacant and Improved)',
-                                           '447 - Asphalt Plants',
-                                           '448 - Concrete Mixing Plants',
-                                           '449 - Miscellaneous (Mining And Allied Industries)',
-                                           '452 - Leather Industry',
-                                           '454 - Textiles & Knitting Mills', '456 - Clothing Industry',
-                                           '458 - Furniture & Fixtures Industry',
-                                           '460 - Printing & Publishing Industry',
-                                           '462 - Primary Metal Industries (Iron & Steel Mills,',
-                                           '464 - Metal Fabricating Industries',
-                                           '466 - Machinery Manufacturing (Excluding Electrical)',
-                                           '470 - Electrical & Electronics Products Industry',
-                                           '472 - Chemical & Chemical Products Industries',
-                                           '474 - Miscellaneous & (Industrial Other)',
-                                           '476 - Grain Elevators',
-                                           '478 - Docks & Wharves',
-                                           '480 - Shipyards',
-                                           '500 - Railway',
-                                           '505 - Marine & Navigational Facilities (Includes Ferry',
-                                           '510 - Bus Company, Including Street Railway', '520 - Telephone',
-                                           '530 - Telecommunications (Other Than Telephone)',
-                                           '515 - Airports, Heliports, Etc.',
-                                           '540 - Community Antenna Television (Cablevision)',
-                                           '550 - Gas Distribution Systems',
-                                           '560 - Water Distribution Systems',
-                                           '580 - Electrical Power Systems (Including Non-Utility']
-                    }
-
-                    # Broaden 'other' uses for a better accuracy on diversity indexes
-                    uses['other'] = uses['other'] + uses['vacant'] + uses['parking'] + uses['agriculture'] + uses['industrial']
-                    uses['vacant'], uses['parking'], uses['agriculture'], uses['industrial'] = [], [], [], []
-"""
-
-                    new_uses = []
-                    index = list(out_gdf.columns).index("PRIMARY_ACTUAL_USE")
-                    all_prim_uses = [item for sublist in list(uses.values()) for item in sublist]
-                    for row in out_gdf.iterrows():
-                        for key, value in uses.items():
-                            if row[1]['PRIMARY_ACTUAL_USE'] in value:
-                                new_uses.append(key)
-                        if row[1]['PRIMARY_ACTUAL_USE'] not in all_prim_uses:
-                            new_uses.append('other')
-                    out_gdf['n_use'] = new_uses
-
-                    # Export assessment fabric layer to GeoPackage
-                    out_gdf.to_file(city.gpkg, driver='GPKG', layer='land_assessment_fabric')
-
-                    # Delete repeated parcels
-                    p_gdf = out_gdf.drop_duplicates(subset=['geometry'])
-
-                    # Classify parcels into categories
-                    p_gdf.loc[:, 'area'] = p_gdf.loc[:, 'geometry'].area
-                    p_gdf.loc[p_gdf['area'] < 400, 'n_size'] = 'less than 400'
-                    p_gdf.loc[(p_gdf['area'] > 400) & (p_gdf['area'] < 800), 'n_size'] = '400 to 800'
-                    p_gdf.loc[(p_gdf['area'] > 800) & (p_gdf['area'] < 1600), 'n_size'] = '800 to 1600'
-                    p_gdf.loc[(p_gdf['area'] > 1600) & (p_gdf['area'] < 3200), 'n_size'] = '1600 to 3200'
-                    p_gdf.loc[(p_gdf['area'] > 3200) & (p_gdf['area'] < 6400), 'n_size'] = '3200 to 6400'
-                    p_gdf.loc[p_gdf['area'] > 6400, 'n_size'] = 'more than 6400'
-
-                    # Convert area to square km
-                    p_gdf.loc[:, 'area_sqkm'] = p_gdf.loc[:, 'geometry'].area/100000
-
-                    # Export parcel layer to GeoPackage
-                    p_gdf = p_gdf.drop('area', axis=1)
-                    p_gdf['geometry'] = p_gdf['geometry'].buffer(0)
-
-                    # Export geojson and read again to try to export to GeoPackage
-                    p_gdf.to_file(city.gpkg, driver='GPKG', layer='land_assessment_parcels')
-                    elapsed = round((timeit.default_timer() - start_time) / 60, 1)
-                    return print(f"> Data aggregation from BC Assessment finished in {elapsed} minutes")
-
-    # BC Transit
-    def get_bc_transit(self, urls, run=True, down=True):
-        if run:
-            if len(urls) != len(self.cities): print("Number of urls and BC cities must be the same")
-            else:
-                for city, url in zip(self.cities, urls):
-                    dir = f'{city.directory}Databases/BCTransit'
-                    if down:
-                        print(f"Downloading transit data from BC Transit for {city.municipality}")
-                        zip_path = f"{dir}/{city.municipality}.{url.split('/')[len(url.split('/'))-1]}"
-                        filename = download_file(url, file_path=zip_path)
-                        os.rename(filename, zip_path)
-
-                    # Create directory if it doesn't exist
-                    n_dir = f"{dir}/{city.municipality}"
-                    if os.path.exists(n_dir): pass
-                    else: os.mkdir(n_dir)
-
-                    if down:
-                        # Unzip data and delete file
-                        with zipfile.ZipFile(zip_path, "r") as zip_ref:
-                            zip_ref.extractall(n_dir)
-                        os.remove(zip_path)
-
-                    # Read stops and stop_times
-                    stops = pd.read_csv(f"{n_dir}/stops.txt")
-                    stops.set_index('stop_id')
-                    times = pd.read_csv(f"{n_dir}/stop_times.txt")
-                    calen = pd.read_csv(f"{n_dir}/calendar_dates.txt")
-
-                    # Calculate frequency of trips on each stop
-                    for stop in times['stop_id'].unique():
-                        s_df = times.loc[times['stop_id'] == stop]
-                        n_trips = len(s_df['trip_id'].unique())
-                        frequency = n_trips/len(calen)
-                        stops.loc[stops['stop_id'] == stop, 'n_trips'] = int(n_trips)
-                        stops.loc[stops['stop_id'] == stop, 'frequency'] = frequency
-                        print(f"> Stop {stop} processed with {n_trips} trips at a frequency of {frequency} trips per day")
-
-                    # Create stop geometries
-                    stops['geometry'] = [Point(lon, lat) for lon, lat in zip(stops.stop_lon, stops.stop_lat)]
-                    stops['z_id'] = stops['zone_id']
-                    stops = stops.drop('zone_id', axis=1)
-                    stops_gdf = gpd.GeoDataFrame(stops, geometry='geometry')
-                    stops_gdf = stops_gdf.dropna(subset=['frequency', 'geometry'], axis=0)[stops_gdf.geometry.is_valid]
-                    stops_gdf = stops_gdf.reset_index(drop=True)
-
-                    # Reproject and export
-                    stops_gdf.crs = 4326
-                    stops_gdf = stops_gdf.to_crs(city.crs)
-                    stops_gdf.to_file(city.gpkg, layer='network_stops')
-                    print(f"Transit stops for {city.municipality} saved at 'network_transit' layer")
-        return
-
-    def get_air_quality(self):
-        url = "http://www.env.gov.bc.ca/epd/bcairquality/aqo/csv/bc_air_monitoring_stations.csv"
-        fp = download_file(url=url, file_path=f"Databases/OpenDataBC/{url.split('/')[-1]}")
-
-        df = pd.read_csv(fp)
-
-        for city in self.cities:
-            # Load and reproject data
-            gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.LONGITUDE, df.LATITUDE))
-            gdf.crs = 4326
-            gdf = gdf.to_crs(city.crs)
-
-            # Reproject city boundary
-            bound = city.boundary.to_crs(city.crs)
-
-            # Join data within bounds
-            try: gdf = gpd.overlay(gdf, bound, how='intersection')
-            except: pass
-            if len(gdf) > 0:
-                gdf.to_file(city.gpkg, layer='bc_air_quality')
-                print(f"Air quality data downloaded with {len(gdf)} features for {city.municipality}")
-            else: print(f"Air quality not downloaded for {city.municipality}")
 
 
 class Vancouver:
     """Web scraping Vancouver OpenData"""
     def __init__(self, directory):
         self.directory = directory
+        self.scraper = Scraper()
         return
 
-    def get_permits(self):
-        # Get list of pdfs from ongoing development permits at City of Vancouver webpage
-        url = 'https://development.vancouver.ca/'
-        s = Scraper()
-        links = s.get_all_links(url)
-        pdfs = {}
-        for link in links:
-            if link != None:
-                if ('.pdf' in link) or ('.PDF' in link):
-                    pass
-                else:
-                    try: name = link.split(url)[1]
-                    except: name = 'unknown'
-                    pdfs[name] = []
-                    sublinks = s.get_all_links(link)
-                    if sublinks is not None:
-                        for sublink in sublinks:
-                            if sublink is None:
-                                pass
-                            elif '.pdf' in sublink:
-                                pdfs[name].append(sublink)
-        s.close_session()
+    def train_ner(self, blank=False):
+        if blank: nlp = spacy.blank('en')
+        else: nlp = spacy.load('en_core_web_sm')
 
-        # Download pdfs and move it to a folder
-        for key, value in pdfs.items():
-            for pdf in value:
-                try: pieces = pdf.split(url)[1]
-                except: pieces = pdf
-                pieces = pieces.split('/')
-                filename = '_'.join(pieces)
-                print(f"> Downloading and saving {filename}")
-                response = requests.get(pdf)
-                with open(f'{self.directory}{filename}', 'wb') as f:
-                    f.write(response.content)
-                print(f"> {filename} downloaded and saved")
+        # Getting the pipeline component
+        if 'ner' not in nlp.pipe_names:
+            ner = nlp.create_pipe('ner')
+            nlp.add_pipe(ner, last=True)
+        else: ner = nlp.get_pipe('ner')
 
-        print(str(len(pdfs)) + ' permit documents downloaded at ' + str(datetime.datetime.now()))
-        return
+        # Training data
+        train_data = [
+            ("2-26 East 1st Avenue is part of CD-1 (464), a Comprehensive Development zone that was approved by Council on June 27, 2006.", {
+                "entities": [(0, 20, "LOC"), (32, 42, "CD_ZONE")]}),
+            ("a floor space ratio (FSR) of 6.98", {"entities": [(29, 33, "FSR")]}),
+            ("a maximum building height of 53.3 m (174.7 ft.); and", {"entities": [(29, 35, "HEIGHT")]}),
+            ("169 underground parking spaces.", {"entities": [(0, 4, "PARKING")]}),
+            ("20 vehicle parking spaces and 106 bicycle parking spaces", {"entities": [(0, 2, "PARKING")]}),
+            ("The zoning would change from RM-4 (multiple dwelling) to CD-1 (comprehensive development).", {
+                "entities": [(29, 34, "ZONE"), (57, 62, "CD_ZONE")]}),
+            ("On August 3, 2017, the City of Vancouver received an application from Musson Cattell Mackey Partnership Architects to rezone 2715 West 12th Avenue from RS-7 (One-Family Dwelling) District to CD-1 (Comprehensive Development) District, to permit a 3.5-storey townhouse development.", {
+                "entities": [(125, 147, "LOC"), (152, 157, "ZONE"), (191, 196, "CD_ZONE")]}),
+            ("The City of Vancouver has received a revised application from the Red Door Housing Society to rezone 870 East 8th Avenue from RM-4 (Multiple Dwelling) District to CD-1 (Comprehensive Development) District.", {
+                "entities": [(101, 121, "LOC"), (126, 131, "ZONE"), (163, 168, "CD_ZONE")]}),
+            ("a building height of 21.3 m (69.9 ft.); ", {"entities": [(21, 27, "HEIGHT")]}),
+            ("a floor space ratio (FSR) of 2.80", {"entities": [(29, 33, "FSR")]}),
+            ("an overall floor space ratio of 10.9 FSR;", {"entities": [(32, 37, "FSR")]}),
+            ("Phone 604-806-0268 ", {"entities": [(6, 19, "PHONE")]}),
+            ("a height of 62 ft. (18.9 m)", {"entities": [(12, 18, "HEIGHT"), (20, 26, "HEIGHT")]}),
+            ("The proposal is for a 16-storey mixed-use building with ground-level commercial uses and 188 residential units. The proposal includes a floor space ratio (FSR) of 8.86, a  height of 146 ft. (44.5 m) from Main and 152 ft. (46.3 m) from the lane,  72 parking spaces, and 235 bicycle stalls.", {
+                "entities": [(163, 167, "FSR"), (183, 190, "HEIGHT"), (191, 197, "HEIGHT"), (246, 249, "PARKING")]}),
+            ("The proposal consists of a height of 410.8 ft. (125.22 m), a floor space ratio (FSR) of 8.6", {
+                "entities": [(37, 45, "HEIGHT"), (48, 56, "HEIGHT"), (88, 91, "FSR")]})
+        ]
+
+        print(train_data)
+
+        # Add labels to 'ner'
+        for _, annotations in train_data:
+            for ent in annotations.get("entities"):
+                ner.add_label(ent[2])
+
+        # Disable pipeline components you dont need to change
+        pipe_exceptions = ["ner", "trf_wordpiecer", "trf_tok2vec"]
+        unaffected_pipes = [pipe for pipe in nlp.pipe_names if pipe not in pipe_exceptions]
+
+        # Training the model
+        with nlp.disable_pipes(*unaffected_pipes):
+
+            # Training for 30 iterations
+            for iteration in range(30):
+                optimizer = nlp.begin_training()
+                # Shuffling examples  before every iteration
+                random.shuffle(train_data)
+                losses = {}
+                # batch up the examples using spaCy's minibatch
+                batches = minibatch(train_data, size=compounding(4.0, 32.0, 1.001))
+                for batch in batches:
+                    texts, annotations = zip(*batch)
+                    nlp.update(
+                        texts,  # batch of texts
+                        annotations,  # batch of annotations
+                        drop=0.5,  # dropout - make it harder to memorise data
+                        losses=losses,
+                        sgd=optimizer
+                    )
+                    print("Losses", losses)
+        return nlp
+
+    def get_url_pdfs(self, run=True, url='https://development.vancouver.ca/'):
+        if run:
+            # Get list of pdfs from ongoing development permits at City of Vancouver webpage
+            links = self.scraper.get_sublinks(url)
+            pdfs = {}
+            ignore = ['mailto:planninginfo@vancouver.ca']
+
+            # Get pdfs in links and sublinks
+            for link in links:
+                print(link)
+                if (link not in ignore) & (link is not None):
+                    if ('.pdf' in link) or ('.PDF' in link) or ('mailto' in link):
+                        pass
+                    else:
+                        try: name = link.split(url)[1]
+                        except: name = 'unknown'
+                        pdfs[name] = []
+                        sublinks = self.scraper.get_sublinks(link)
+                        if sublinks is not None:
+                            for sublink in sublinks:
+                                if sublink is None:
+                                    pass
+                                elif '.pdf' in sublink:
+                                    pdfs[name].append(sublink)
+
+            # Download pdfs and move it to a folder
+            for key, value in pdfs.items():
+                for pdf in value:
+                    if 'file:///' not in pdf:
+                        try: pieces = pdf.split(url)[1]
+                        except: pieces = pdf
+                        pieces = pieces.split('/')
+                        filename = '_'.join(pieces)
+                        print(f"> Downloading and saving {filename}")
+                        response = requests.get(pdf)
+
+                        dir_name = f"{self.directory}{url.split('//')[1].split('.')[0]}/"
+                        if not os.path.exists(dir_name): os.mkdir(dir_name)
+                        with open(f'{dir_name}{filename}', 'wb') as f:
+                            f.write(response.content)
+                        print(f"> {filename} downloaded and saved")
+
+            return print(str(len(pdfs)) + ' documents downloaded at ' + str(datetime.datetime.now()))
+
+
+    def scrape_rezoning(self, run=True):
+
+        # nlp = self.train_ner()
+        if run:
+
+            sl = self.scraper.get_sublinks('https://rezoning.vancouver.ca/applications/archives/index.htm')
+            applications = pd.DataFrame()
+            for i, link in enumerate(sl):
+                try:
+                    if (len(link.split('/')) > 5) and ('#' not in link):
+                        page_id = link.split('/')[len(link.split('/'))-2]
+                        applications.at[i, 'ID'] = page_id
+
+                        page = requests.get(link)
+                        tree = html.fromstring(page.content)
+                        tree.xpath("//h1/text()")
+
+                        h2s = tree.xpath("//h2/text()")
+                        lists = tree.xpath("//li/text()")
+                        strong = tree.xpath('//span[@class="boldText"]/text()') + tree.xpath('//p[@class="boldText"]/text()') + tree.xpath("//strong/text()")
+                        prg = tree.xpath('//p/text()')
+
+                        # Get rezoning information
+                        def find_dates(txt):
+                            months = [
+                                'January', 'February', 'March', 'April', 'May', 'June',
+                                'July', 'August', 'September', 'October', 'November', 'December'
+                            ]
+
+                            txt = re.sub(' +', ' ', txt)
+                            if "\r\n" in txt:
+                                txt = txt.replace("\r\n", " ")
+                            for m in months:
+                                if m in txt:
+                                    return txt[txt.find(m):txt.find(m) + len(m) + 9]
+
+                        # Find approval dates
+                        approved = []
+                        for j, text in enumerate(strong):
+                            d = find_dates(text)
+                            if 'approved' in text:
+                                approved.append(pd.to_datetime(d))
+                            elif ('approved' in strong[j - 1]) and (len(approved) == 0):
+                                approved.append(pd.to_datetime(d))
+
+                        if len(approved) == 0: pass
+                        elif len(approved) > 1:
+                            applications.at[i, 'Approved'] = \
+                                pd.Series(approved).sort_values(ascending=False).reset_index(drop=True)[0]
+                        else:
+                            applications.at[i, 'Approved'] = approved[0]
+
+                        # Find application date
+                        applied = []
+                        for text in h2s:
+                            d = find_dates(text)
+                            applied.append(pd.to_datetime(d))
+
+                        if len(applied) == 0: pass
+                        elif len(applied) > 1:
+                            applications.at[i, 'Applied'] = \
+                                pd.Series(applied).sort_values(ascending=True).reset_index(drop=True)[0]
+                        else:
+                            applications.at[i, 'Applied'] = applied[0]
+
+                            # doc = nlp(str(text))
+                            # ent_list = [(ent.text, ent.label_) for ent in doc.ents]
+
+                            # if len(ent_list) > 0:
+                            #     print(
+                            #         f"Paragraph: {text} \n"
+                            #         "Entities", ent_list
+                            #     )
+
+                        table_rows = tree.xpath("//div[contains(@class, 'D(tbr)')]")
+
+                        # Get rental housing info
+                        full_txt = ' '.join(h2s + strong + lists + prg)
+                        applications.at[i, 'Rental'] = [1 if ('rental' in full_txt) or ('Rental' in full_txt) else 0][0]
+                except: pass
+
+            app_clean = applications.dropna(subset=['Approved', 'Applied'])
+            print(f"> {len(app_clean)} rezoning applications found")
+            app_clean = app_clean.sort_values('Approved')
+
+            app_clean['Year'] = [date.year for date in app_clean['Approved']]
+            app_clean['Duration'] = app_clean['Approved'] - app_clean['Applied']
+            app_clean.to_csv(f'{self.directory}Rezoning.csv', index=False)
+
+            return applications
+
+    def close_session(self):
+        return self.scraper.close_session()
