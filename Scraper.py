@@ -364,7 +364,7 @@ class GeoScraper:
                      'date': dates})
                 coord_nnull = df['geometry'] != "POINT (0.0 0.0)"
                 area_nnull = df['area'].notnull()
-                df = df[(area_nnull) & (coord_nnull)]
+                df = df[area_nnull & coord_nnull]
 
                 # Geoprocess Coordinates
                 df['geometry'] = df['geometry'].apply(wkt.loads)
@@ -374,48 +374,63 @@ class GeoScraper:
                 # Filter area and bedrooms None
                 cl_gdf = cl_gdf[(cl_gdf['area'] != None) & (cl_gdf['bedrooms'] != None)]
 
+                # Split "ft" on area field
+                cl_gdf['area'] = [ar.split("ft")[0] if 'ft' in ar else ar for ar in cl_gdf['area']]
+
+                # Split "" on bedrooms field
+
+
                 # Calculate Price/Area
                 cl_gdf['area'] = cl_gdf['area'].astype(float)
+                cl_gdf['bedrooms'] = cl_gdf['bedrooms'].astype(float)
                 cl_gdf['price_sqft'] = cl_gdf['price'] / cl_gdf['area']
+                cl_gdf['price_bed'] = cl_gdf['price'] / cl_gdf['bedrooms']
 
-                # Get Vancouver Boundary
-                van_gdf = ox.geocode_to_gdf(self.city.municipality)
-                van_gdf.crs = 4326
-                van_gdf.to_crs(epsg=self.crs)
-                van_pol = van_gdf.geometry[0]
-                if van_pol is None: print('Administrative boundary download failed :(')
+                # # Get Vancouver Boundary
+                # van_gdf = ox.geocode_to_gdf(self.city.municipality)
+                # van_gdf.crs = 4326
+                # van_gdf.to_crs(epsg=self.crs)
+                # van_pol = van_gdf.geometry[0]
+                # if van_pol is None: print('Administrative boundary download failed :(')
 
                 # Filter data
                 pd.set_option('display.min_rows', 10)
-                cl_gdf.to_crs(epsg=self.crs)
-                cl_gdf = cl_gdf[cl_gdf.within(van_pol)]
+                cl_gdf = cl_gdf.to_crs(epsg=self.crs)
                 csv_path = '__pycache__/' + self.city.municipality + '_Craigslist.csv'
                 cl_gdf = cl_gdf[cl_gdf['area'] > 270]
 
-                # Write data in csv
-                with io.open(csv_path, "a", encoding="utf-8") as f:
-                    cl_gdf.to_csv(f, header=False, index=False)
-                df = pd.read_csv(csv_path)
-                df = df.drop_duplicates()
-                df.to_csv(csv_path, header=False, index=False)
+                # # Write data in csv
+                # with io.open(csv_path, "a", encoding="utf-8") as f:
+                #     cl_gdf.to_csv(f, header=False, index=False)
+                # df = pd.read_csv(csv_path)
+                # df = df.drop_duplicates()
+                # df.to_csv(csv_path, header=False, index=False)
 
                 # Write data in GeoPackage
-                df = pd.read_csv(csv_path, encoding="utf8")
-                df.columns = ['index', 'description', 'price', 'area', 'bedrooms', 'geometry', 'date', 'price_sqft']
-                numerics = ['price', 'area', 'bedrooms', 'price_sqft']
+                df = cl_gdf
+                df.columns = ['index', 'description', 'price', 'area', 'bedrooms', 'geometry', 'date', 'price_sqft', 'price_bed']
+                numerics = ['price', 'area', 'bedrooms', 'price_sqft', 'price_bed']
                 for i in numerics: pd.to_numeric(df[i], errors='coerce').fillna(0).astype(float)
                 gdf = gpd.GeoDataFrame(df)
-                gdf['geometry'] = gdf['geometry'].apply(wkt.loads)
+                # gdf['geometry'] = gdf['geometry'].apply(wkt.loads)
                 gdf.set_geometry('geometry')
-                gdf.crs = 4326
+                gdf.crs = self.crs
 
                 # Read existing data
-                try: cl_cur = gpd.read_file(f"{self.dir}{self.city.municipality}.gpkg", layer='craigslist_housing', driver='GPKG')
-                except: cl_cur = gpd.GeoDataFrame()
-                try: cl_cur.drop('fid', inplace=True)
-                except: pass
-                gdf = pd.concat([cl_cur, gdf])
+                try:
+                    cl_cur_hou = gpd.read_file(f"{self.dir}{self.city.municipality}.gpkg", layer='craigslist_housing', driver='GPKG')
+                    cl_cur_hou = cl_cur_hou.to_crs(self.crs)
+                except: cl_cur_hou = gpd.GeoDataFrame()
+                try:
+                    cl_cur_rnt = gpd.read_file(f"{self.dir}{self.city.municipality}.gpkg", layer='craigslist_rent', driver='GPKG')
+                    cl_cur_rnt = cl_cur_rnt.to_crs(self.crs)
+                except: cl_cur_rnt = gpd.GeoDataFrame()
+                for i in [cl_cur_hou, cl_cur_rnt]:
+                    try: i = i.drop('fid')
+                    except: pass
+                gdf = pd.concat([cl_cur_hou, cl_cur_rnt, gdf])
                 gdf.drop_duplicates(inplace=True)
+                gdf['price_bed'] = gdf['price'] / gdf['bedrooms']
                 print(f"Craigslist data for {self.city.municipality} downloaded and joined with {len(gdf)} data points :)")
 
                 # Separate buy and rent posts

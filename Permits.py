@@ -37,7 +37,9 @@ rental_df['RentalMS'] = rental_df['Rental']/rental_df['Total']
 # Setup figures
 timeline = px.timeline(rez, x_start='Applied', x_end='Approved', y='ID', color='Duration (Days)', height=700, title="Rezoning Timeline")
 timeline = timeline.update_layout(yaxis={'visible': False, 'showticklabels': True})
+timeline.write_image('images/timeline.png')
 cost = px.line(df, x='Year', y='Fee', color='Item', height=350, line_shape="spline", title="Maximum Permit Fees")
+cost.write_image('images/fees.png')
 rental = px.line(rental_df, x="Year", y=["Rental", "Not rental","Total"], height=350, line_shape="spline", title='Applications')
 
 def style(fig):

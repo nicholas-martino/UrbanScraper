@@ -2,7 +2,7 @@ regions = { # Name to be searched on OpenStreetMap
     'Canada':
         {
             'British Columbia': [
-                'Capital Regional District',
+                # 'Capital Regional District',
                 # 'Fraser Valley Regional District',
                 'Metro Vancouver',
                 # 'Nanaimo Regional District',
@@ -12,7 +12,7 @@ regions = { # Name to be searched on OpenStreetMap
 }
 
 sites = [ # Craigslist location site
-    'victoria',
+    # 'victoria',
     # 'abbotsford',
     'vancouver',
     # 'nanaimo',
